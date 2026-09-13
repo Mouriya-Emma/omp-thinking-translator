@@ -1,51 +1,42 @@
 {
   "name": "pi-thinking-translator",
-  "version": "0.2.0",
-  "description": "Pi extension package for translating configured visible assistant content blocks.",
+  "version": "0.3.0",
+  "description": "omp extension for translating visible assistant thinking blocks.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wplct/pi-thinking-translator.git"
+    "url": "git+https://github.com/mouriya-s-lab/pi-thinking-translator.git"
   },
-  "homepage": "https://github.com/wplct/pi-thinking-translator#readme",
+  "homepage": "https://github.com/mouriya-s-lab/pi-thinking-translator#readme",
   "bugs": {
-    "url": "https://github.com/wplct/pi-thinking-translator/issues"
+    "url": "https://github.com/mouriya-s-lab/pi-thinking-translator/issues"
   },
-  "publishConfig": {
-    "access": "public"
-  },
+  "private": true,
   "keywords": [
-    "pi-package",
-    "pi-extension",
-    "pi-coding-agent",
+    "omp",
+    "omp-extension",
     "thinking",
-    "reasoning",
     "translation"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit --skipLibCheck --moduleResolution bundler --module esnext --target es2022 --types node extensions/thinking-translator.ts",
-    "test": "node --test tests/*.test.ts",
-    "check": "tsc --noEmit --skipLibCheck --moduleResolution bundler --module esnext --target es2022 --types node extensions/thinking-translator.ts && node --test tests/*.test.ts"
+    "test": "bun test tests/thinking-translator.test.ts",
+    "check": "pnpm typecheck && pnpm test"
   },
   "files": [
     "extensions",
     "README.md"
   ],
-  "pi": {
+  "omp": {
     "extensions": [
       "./extensions/thinking-translator.ts"
     ]
   },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
-  },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
-    "@earendil-works/pi-tui": "0.85.1",
+    "@oh-my-pi/pi-ai": "18.1.19",
+    "@oh-my-pi/pi-coding-agent": "18.1.19",
+    "@oh-my-pi/pi-tui": "18.1.19",
     "@types/node": "^24.3.0",
     "typescript": "^5.7.3"
   }

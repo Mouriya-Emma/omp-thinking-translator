@@ -1,79 +1,67 @@
-import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { Api, AssistantMessageEvent, Model, ProviderHeaders } from "@earendil-works/pi-ai";
-import { stream } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text } from "@earendil-works/pi-tui";
+import { stream, type Api, type Model } from "@oh-my-pi/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { getMarkdownTheme } from "@oh-my-pi/pi-coding-agent";
+import { Box, Markdown, Text } from "@oh-my-pi/pi-tui";
 
 type ModelRef = { provider: string; id: string };
-type TranslatableBlockType = "thinking" | "text";
 type TranslationLineSource = { index: number; source: string };
-type TranslationLine = TranslationLineSource & {
-	translation: string;
-	status: "pending" | "streaming" | "done" | "error";
-	error?: string;
+type TranslationProgress =
+	| { status: "pending" }
+	| { status: "streaming" | "done"; translation: string }
+	| { status: "error"; error: string };
+type TranslationLine = TranslationLineSource & { progress: TranslationProgress };
+type TranslationBlock = { lines: TranslationLine[] };
+type ResolvedTranslatorConfig = {
+	enabled: boolean;
+	targetLanguage: string;
+	minLatinChars: number;
+	translatorModel?: ModelRef;
 };
-type EntryData = { blockKey: string; ordinal: number; kind: TranslatableBlockType; lines: TranslationLine[] };
-type AssistantTranslationState =
-	| { status: "idle" }
-	| { status: "streaming"; streamId: string; nextOrdinal: number; pendingBlocks: EntryData[] };
-type TranslatorConfig = {
-	enabled?: boolean;
-	targetLanguage?: string;
-	contentTypes?: TranslatableBlockType[];
-	minLatinChars?: number;
-	translatorModel?: Partial<ModelRef> | null;
-};
-type ResolvedTranslatorConfig = Omit<Required<TranslatorConfig>, "translatorModel"> & { translatorModel?: ModelRef };
 type NotifyLevel = "info" | "warning" | "error";
 type NotifierContext = {
-	ui?: {
-		notify?: (message: string, level?: NotifyLevel) => void;
-		setStatus?: (key: string, text: string | undefined) => void;
-	};
+	ui?: { notify?: (message: string, level?: NotifyLevel) => void };
 	cwd?: string;
 };
 type ConfigPathInfo = { scope: "global" | "project"; path: string; exists: boolean };
 type ConfigLoadError = { scope: "global" | "project"; path: string; error: unknown };
 type ConfigState = { config: ResolvedTranslatorConfig; paths: ConfigPathInfo[]; errors: ConfigLoadError[] };
-type TranslatorRegistry = Pick<ModelRegistry, "find" | "getApiKeyAndHeaders">;
 
 const CONFIG_FILE_NAME = "thinking-translator.json";
-const ENTRY_TYPE = "thinking-translation";
-const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "agent", CONFIG_FILE_NAME);
 const DEFAULT_CONFIG: ResolvedTranslatorConfig = {
 	enabled: true,
 	targetLanguage: "Simplified Chinese",
-	contentTypes: ["thinking"],
 	minLatinChars: 250,
 };
-const streamNonce = randomUUID();
 const configErrorNotified = new Set<string>();
 const translationFailureNotified = new Set<string>();
-const liveBlocks = new Map<string, EntryData>();
 let missingModelWarningKey: string | undefined;
-let translationEpoch = 0;
-let assistantMessageSerial = 0;
-let currentAssistant: AssistantTranslationState = { status: "idle" };
 
-/** 将译文作为独立会话条目展示，避免污染原消息和模型上下文。 */
+/** 译文只附着在可见 thinking 下方，不写入会话或模型上下文。 */
 export default function thinkingTranslator(pi: ExtensionAPI) {
-	pi.registerEntryRenderer<EntryData>(ENTRY_TYPE, (entry, _options, theme) => {
-		if (!entry.data) return undefined;
-		const snapshot = entry.data;
+	const liveBlocks = new Map<string, TranslationBlock>();
+	let requestRender: (() => void) | undefined;
+	let controller = new AbortController();
+
+	pi.registerAssistantThinkingRenderer((context, theme) => {
+		const key = thinkingTextKey(context.text);
+		requestRender = context.requestRender;
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		const title = new Text("", 0, 0);
 		const body = new Markdown("", 0, 0, getMarkdownTheme());
 		box.addChild(title);
 		box.addChild(body);
 		return {
-			render(width: number): string[] {
-				const data = liveBlocks.get(snapshot.blockKey) ?? snapshot;
-				const completed = data.lines.filter((line) => line.status === "done" || line.status === "error").length;
-				title.setText(theme.fg("accent", `${data.kind === "thinking" ? "思考翻译" : "文本翻译"} · 块 ${data.ordinal} · ${completed}/${data.lines.length}`));
+			render(width: number): readonly string[] {
+				const data = liveBlocks.get(key);
+				if (!data) return [];
+				let completed = 0;
+				for (const line of data.lines) {
+					if (line.progress.status === "done" || line.progress.status === "error") completed++;
+				}
+				title.setText(theme.fg("accent", `思考翻译 · 块 ${context.thinkingIndex + 1} · ${completed}/${data.lines.length}`));
 				body.setText(data.lines.map(formatTranslationLine).join("\n\n"));
 				return box.render(width);
 			},
@@ -89,139 +77,106 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			const options = ["status", "init", "init --global", "init --project"];
 			return options.filter((option) => option.startsWith(prefix)).map((value) => ({ value, label: value }));
 		},
-		handler: async (args, ctx) => {
-			await handleConfigCommand(args, ctx);
-		},
+		handler: handleConfigCommand,
 	});
 
-	pi.on("session_start", async () => {
-		invalidateTranslations();
-	});
-	pi.on("agent_start", async () => {
-		invalidateTranslations();
-	});
-	pi.on("message_start", (event) => {
-		if (event.message.role !== "assistant") return;
-		currentAssistant = {
-			status: "streaming",
-			streamId: `${streamNonce}:${++assistantMessageSerial}`,
-			nextOrdinal: 1,
-			pendingBlocks: [],
-		};
-	});
+	/** 切换会话时中止旧请求；新一轮对话保留已显示的译文。 */
+	function resetTranslations(): void {
+		controller.abort();
+		controller = new AbortController();
+		liveBlocks.clear();
+		configErrorNotified.clear();
+		requestRender = undefined;
+		translationFailureNotified.clear();
+		missingModelWarningKey = undefined;
+	}
+	pi.on("session_start", resetTranslations);
+	pi.on("session_switch", resetTranslations);
+	pi.on("session_shutdown", resetTranslations);
+
 	pi.on("message_update", (event, ctx) => {
 		const blockEvent = event.assistantMessageEvent;
-		if (blockEvent.type !== "thinking_end" && blockEvent.type !== "text_end") return;
-		translateCompletedBlock(blockEvent, ctx);
-	});
-	pi.on("message_end", (event) => {
-		if (event.message.role !== "assistant" || currentAssistant.status !== "streaming") return;
-		// 流式组件结束后再追加，确保所有译文框都位于原 assistant 消息下方。
-		for (const data of currentAssistant.pendingBlocks.sort((left, right) => left.ordinal - right.ordinal)) {
-			pi.appendEntry(ENTRY_TYPE, data);
+		if (blockEvent.type !== "thinking_end") return;
+		const config = loadConfig(ctx);
+		if (!config.enabled || !shouldTranslate(blockEvent.content, config)) return;
+		const key = thinkingTextKey(blockEvent.content);
+		if (liveBlocks.has(key)) return;
+		const lines: TranslationLine[] = splitTranslationLines(blockEvent.content)
+			.map((line) => ({ ...line, progress: { status: "pending" } }));
+		if (lines.length === 0) return;
+		const model = resolveTranslatorModel(ctx, config);
+		if (!model) return;
+		liveBlocks.set(key, { lines });
+		// 完整文本的组件可能早于结束事件创建，状态入表后立即请求重绘。
+		requestRender?.();
+		for (const line of lines) {
+			void translateLine(line, ctx, config, model, controller.signal, () => requestRender?.());
 		}
-		currentAssistant = { status: "idle" };
-	});
-	pi.on("session_shutdown", async () => {
-		invalidateTranslations();
 	});
 }
 
 /** 保留原行数组顺序，让较晚完成的译文仍回到自己的位置。 */
 function formatTranslationLine(line: TranslationLine): string {
-	switch (line.status) {
+	switch (line.progress.status) {
 		case "pending":
 			return "等待翻译…";
 		case "streaming":
-			return line.translation || "翻译中…";
+			return line.progress.translation || "翻译中…";
 		case "done":
-			return line.translation;
+			return line.progress.translation;
 		case "error":
-			return `翻译失败：${(line.error ?? "未知错误").replace(/\s+/g, " ").slice(0, 120)}`;
-	}
-}
-
-/** 只使用结束事件的权威全文，避免把未完成段落提前送给翻译模型。 */
-function translateCompletedBlock(event: Extract<AssistantMessageEvent, { type: "thinking_end" | "text_end" }>, ctx: ExtensionContext): void {
-	if (currentAssistant.status !== "streaming") return;
-	const config = loadConfig(ctx);
-	const kind = event.type === "thinking_end" ? "thinking" : "text";
-	if (!config.enabled || !config.contentTypes.includes(kind) || !shouldTranslate(event.content, config)) return;
-	const blockKey = `${currentAssistant.streamId}:${event.contentIndex}`;
-	if (liveBlocks.has(blockKey)) return;
-	const lines: TranslationLine[] = splitTranslationLines(event.content)
-		.filter((line) => /[A-Za-z]/.test(line.source))
-		.map((line) => ({ ...line, translation: "", status: "pending" }));
-	if (lines.length === 0) return;
-	const translatorModel = resolveTranslatorModel(ctx, config);
-	if (!translatorModel) return;
-	const data: EntryData = { blockKey, ordinal: currentAssistant.nextOrdinal++, kind, lines };
-	liveBlocks.set(blockKey, data);
-	currentAssistant.pendingBlocks.push(data);
-	for (const line of lines) {
-		void translateLine(line, currentAssistant.streamId, ctx, config, translatorModel, translationEpoch);
+			return `翻译失败：${line.progress.error.replace(/\s+/g, " ").slice(0, 120)}`;
 	}
 }
 
 /** 每行独立请求并立即消费增量，避免慢行阻塞同块其他译文。 */
 async function translateLine(
 	line: TranslationLine,
-	streamId: string,
 	ctx: ExtensionContext,
 	config: ResolvedTranslatorConfig,
 	translatorModel: Model<Api>,
-	epoch: number,
+	signal: AbortSignal,
+	requestRender: () => void,
 ): Promise<void> {
 	try {
 		const auth = await getTranslatorAuth(ctx, translatorModel);
-		if (epoch !== translationEpoch) return;
+		if (signal.aborted) return;
 		const prompt = buildTranslationPrompt(line.source, config.targetLanguage);
 		const eventStream = stream(
 			translatorModel,
 			{ messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(8192, Math.max(1024, Math.ceil(line.source.length * 1.3))), signal: ctx.signal },
+			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(8192, Math.max(1024, Math.ceil(line.source.length * 1.3))), signal },
 		);
+		let translation = "";
 		for await (const event of eventStream) {
-			if (epoch !== translationEpoch) return;
+			if (signal.aborted) return;
 			if (event.type === "error") throw new Error(event.error.errorMessage || `translation ${event.reason}`);
 			if (event.type === "text_delta") {
-				line.status = "streaming";
-				line.translation += event.delta;
-				requestTranslationRender(ctx, streamId);
+				translation += event.delta;
+				line.progress = { status: "streaming", translation };
+				requestRender();
 			}
 		}
-		if (epoch !== translationEpoch) return;
-		line.translation = cleanTranslation(line.translation);
-		line.status = "done";
-		requestTranslationRender(ctx, streamId);
+		if (signal.aborted) return;
+		line.progress = { status: "done", translation: cleanTranslation(translation) };
+		requestRender();
 	} catch (error) {
-		if (epoch !== translationEpoch) return;
-		line.status = "error";
-		line.error = error instanceof Error ? error.message : String(error);
-		requestTranslationRender(ctx, streamId);
+		if (signal.aborted) return;
+		line.progress = { status: "error", error: error instanceof Error ? error.message : String(error) };
+		requestRender();
 		notifyTranslationFailure(ctx, error);
 	}
 }
 
-/** 流式结束后借状态栏触发重绘，流式期间则复用宿主已有的刷新。 */
-function requestTranslationRender(ctx: NotifierContext, streamId: string): void {
-	if (currentAssistant.status === "streaming" && currentAssistant.streamId === streamId) return;
-	ctx.ui?.setStatus?.("thinking-translator", undefined);
+/** 统一换行和块首尾空白，让结束事件与宿主显示文本使用相同身份。 */
+function thinkingTextKey(text: string): string {
+	return text.replace(/\r\n/g, "\n").trim();
 }
 
-/** 让旧请求在生命周期切换后无法再修改条目或发出提示。 */
-function invalidateTranslations(): void {
-	translationEpoch++;
-	currentAssistant = { status: "idle" };
-	liveBlocks.clear();
-	configErrorNotified.clear();
-	translationFailureNotified.clear();
-	missingModelWarningKey = undefined;
-}
-
-/** 按换行符而非段落启发式分行，稳定序号使并发回包不会重排行。 */
+/** 按换行符分行，只请求含拉丁字母的非空行，重复行仍各自保留位置。 */
 function splitTranslationLines(text: string): TranslationLineSource[] {
-	return text.split("\n").map((source) => source.trim()).filter(Boolean).map((source, index) => ({ index, source }));
+	return text.split("\n").map((source) => source.trim()).filter((source) => /[A-Za-z]/.test(source))
+		.map((source, index) => ({ index, source }));
 }
 
 /** 配置只在显式初始化时写入，避免启动扩展就改动用户文件。 */
@@ -237,14 +192,20 @@ async function handleConfigCommand(args: string, ctx: ExtensionContext): Promise
 
 /** 项目配置允许覆盖全局翻译策略。 */
 function getProjectConfigPath(cwd: string | undefined): string | undefined {
-	return cwd ? join(cwd, ".pi", CONFIG_FILE_NAME) : undefined;
+	return cwd ? join(cwd, ".omp", CONFIG_FILE_NAME) : undefined;
+}
+
+/** 使用宿主已解析的 agent 目录，让 profile 与显式目录隔离保持一致。 */
+function getGlobalConfigPath(agentDir: string | undefined, home: string): string {
+	return join(agentDir || join(home, ".omp", "agent"), CONFIG_FILE_NAME);
 }
 
 /** 全局先读、项目后读，确保项目策略拥有覆盖权。 */
 function getConfigPaths(ctx?: NotifierContext): ConfigPathInfo[] {
 	const projectPath = getProjectConfigPath(ctx?.cwd);
+	const globalPath = getGlobalConfigPath(process.env.PI_CODING_AGENT_DIR, homedir());
 	return [
-		{ scope: "global", path: GLOBAL_CONFIG_PATH, exists: existsSync(GLOBAL_CONFIG_PATH) },
+		{ scope: "global", path: globalPath, exists: existsSync(globalPath) },
 		...(projectPath ? [{ scope: "project" as const, path: projectPath, exists: existsSync(projectPath) }] : []),
 	];
 }
@@ -265,7 +226,7 @@ function loadConfigState(ctx?: NotifierContext): ConfigState {
 			continue;
 		}
 		try {
-			const raw = JSON.parse(readFileSync(info.path, "utf8")) as TranslatorConfig;
+			const raw: unknown = JSON.parse(readFileSync(info.path, "utf8"));
 			configErrorNotified.delete(info.path);
 			config = mergeConfig(config, raw);
 		} catch (error) {
@@ -278,11 +239,16 @@ function loadConfigState(ctx?: NotifierContext): ConfigState {
 }
 
 /** 项目层可只覆盖模型的 provider/id 或其他局部字段。 */
-function mergeConfig(base: ResolvedTranslatorConfig, raw: TranslatorConfig): ResolvedTranslatorConfig {
+function mergeConfig(base: ResolvedTranslatorConfig, value: unknown): ResolvedTranslatorConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config must be an object");
+	const raw = value as Record<string, unknown>;
+	if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") throw new Error("enabled must be boolean");
+	if (raw.targetLanguage !== undefined && (typeof raw.targetLanguage !== "string" || !raw.targetLanguage.trim())) throw new Error("targetLanguage must be a non-empty string");
+	if (raw.minLatinChars !== undefined && (typeof raw.minLatinChars !== "number" || !Number.isFinite(raw.minLatinChars) || raw.minLatinChars < 0)) throw new Error("minLatinChars must be a non-negative number");
 	return {
-		...base,
-		...raw,
-		contentTypes: raw.contentTypes === undefined ? base.contentTypes : normalizeContentTypes(raw.contentTypes),
+		enabled: typeof raw.enabled === "boolean" ? raw.enabled : base.enabled,
+		targetLanguage: typeof raw.targetLanguage === "string" ? raw.targetLanguage : base.targetLanguage,
+		minLatinChars: typeof raw.minLatinChars === "number" ? raw.minLatinChars : base.minLatinChars,
 		translatorModel: normalizeTranslatorModel(raw.translatorModel, base.translatorModel),
 	};
 }
@@ -306,35 +272,19 @@ function notifyConfigLoadError(ctx: NotifierContext | undefined, path: string, e
 }
 
 /** 找不到翻译模型时只警告并跳过，不影响主对话。 */
-function resolveTranslatorModel(ctx: NotifierContext & { modelRegistry?: unknown }, config: ResolvedTranslatorConfig): Model<Api> | undefined {
+function resolveTranslatorModel(ctx: ExtensionContext, config: ResolvedTranslatorConfig): Model<Api> | undefined {
 	const modelRef = config.translatorModel;
 	if (!modelRef) {
 		notifyMissingModel(ctx, "not-configured", "thinking-translator enabled but translatorModel is not configured; translation skipped");
 		return undefined;
 	}
-	const registry = getModelRegistry(ctx);
-	if (!registry) {
-		notifyMissingModel(ctx, "registry-unavailable", "thinking-translator model registry is unavailable; translation skipped");
-		return undefined;
-	}
-	const model = registry.find(modelRef.provider, modelRef.id);
+	const model = ctx.modelRegistry.find(modelRef.provider, modelRef.id);
 	if (!model) {
 		notifyMissingModel(ctx, `${modelRef.provider}/${modelRef.id}`, `thinking-translator model not found: ${modelRef.provider}/${modelRef.id}; translation skipped`);
 		return undefined;
 	}
 	missingModelWarningKey = undefined;
 	return model;
-}
-
-/** 检查宿主注册表边界，避免缺失接口时抛出 TypeError。 */
-function getModelRegistry(ctx: unknown): TranslatorRegistry | undefined {
-	if (!ctx || typeof ctx !== "object" || !("modelRegistry" in ctx)) return undefined;
-	const registry = ctx.modelRegistry;
-	if (!registry || typeof registry !== "object"
-		|| !("find" in registry) || typeof registry.find !== "function"
-		|| !("getApiKeyAndHeaders" in registry) || typeof registry.getApiKeyAndHeaders !== "function") return undefined;
-	// 已核实宿主接口存在，模型和鉴权返回值遵循宿主公开类型。
-	return registry as TranslatorRegistry;
 }
 
 /** 同一种模型缺失问题只提示一次。 */
@@ -356,13 +306,11 @@ function notifyTranslationFailure(ctx: NotifierContext, error: unknown): void {
 function showConfigStatus(ctx: ExtensionContext): void {
 	const state = loadConfigState(ctx);
 	const modelRef = state.config.translatorModel;
-	const registry = getModelRegistry(ctx);
-	const modelStatus = modelRef ? (registry ? (registry.find(modelRef.provider, modelRef.id) ? "available" : "not found") : "registry unavailable") : "not configured";
+	const modelStatus = modelRef ? (ctx.modelRegistry.find(modelRef.provider, modelRef.id) ? "available" : "not found") : "not configured";
 	const lines = [
 		"thinking-translator status",
 		`enabled: ${state.config.enabled}`,
 		`targetLanguage: ${state.config.targetLanguage}`,
-		`contentTypes: ${state.config.contentTypes.join(", ")}`,
 		`minLatinChars: ${state.config.minLatinChars}`,
 		`translatorModel: ${modelRef ? `${modelRef.provider}/${modelRef.id}` : "not configured"}`,
 		`model: ${modelStatus}`,
@@ -374,7 +322,7 @@ function showConfigStatus(ctx: ExtensionContext): void {
 
 /** 模板默认禁用，避免用户还没选模型就发起翻译。 */
 function initConfigFile(ctx: ExtensionContext, scope: "global" | "project"): void {
-	const path = scope === "project" ? getProjectConfigPath(ctx.cwd) : GLOBAL_CONFIG_PATH;
+	const path = scope === "project" ? getProjectConfigPath(ctx.cwd) : getGlobalConfigPath(process.env.PI_CODING_AGENT_DIR, homedir());
 	if (!path) {
 		ctx.ui.notify("thinking-translator project config path is unavailable", "warning");
 		return;
@@ -390,7 +338,6 @@ function initConfigFile(ctx: ExtensionContext, scope: "global" | "project"): voi
 			{
 				enabled: false,
 				targetLanguage: DEFAULT_CONFIG.targetLanguage,
-				contentTypes: DEFAULT_CONFIG.contentTypes,
 			},
 			null,
 			2,
@@ -398,13 +345,6 @@ function initConfigFile(ctx: ExtensionContext, scope: "global" | "project"): voi
 		"utf8",
 	);
 	ctx.ui.notify(`created ${scope} config: ${path}\nAdd translatorModel and set enabled to true when ready.`, "info");
-}
-
-/** 只允许宿主流事件确实能产生的文本类 block。 */
-function normalizeContentTypes(value: unknown): TranslatableBlockType[] {
-	if (!Array.isArray(value)) return DEFAULT_CONFIG.contentTypes;
-	const normalized = value.filter((item): item is TranslatableBlockType => item === "thinking" || item === "text");
-	return normalized.length > 0 ? Array.from(new Set(normalized)) : DEFAULT_CONFIG.contentTypes;
 }
 
 /** 要求直译而非响应源文本指令，避免翻译任务变成第二次推理。 */
@@ -438,10 +378,8 @@ function shouldTranslate(text: string, config: ResolvedTranslatorConfig): boolea
 }
 
 /** 鉴权统一走宿主注册表，失败时提供清晰诊断而不另找凭据。 */
-async function getTranslatorAuth(ctx: ExtensionContext, translatorModel: Model<Api>): Promise<{ apiKey?: string; headers?: ProviderHeaders }> {
-	const registry = getModelRegistry(ctx);
-	if (!registry) throw new Error("model registry is unavailable");
-	const auth = await registry.getApiKeyAndHeaders(translatorModel).catch((error: unknown) => {
+async function getTranslatorAuth(ctx: ExtensionContext, translatorModel: Model<Api>): Promise<{ apiKey?: string; headers?: Record<string, string> }> {
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(translatorModel).catch((error: unknown) => {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error("failed to get translator model credentials: " + message);
 	});
@@ -468,12 +406,11 @@ export const __testing = {
 	CONFIG_FILE_NAME,
 	DEFAULT_CONFIG,
 	cleanTranslation,
-	getModelRegistry,
 	getProjectConfigPath,
+	getGlobalConfigPath,
+	thinkingTextKey,
 	mergeConfig,
-	normalizeContentTypes,
 	normalizeTranslatorModel,
-	resolveTranslatorModel,
 	shouldTranslate,
 	splitTranslationLines,
 } as const;

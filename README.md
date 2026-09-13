@@ -1,51 +1,55 @@
-# Pi Thinking Translator
+# Thinking Translator
 
-Translate Pi assistant thinking blocks for display without sending those translations back into future model context.
+An omp extension that translates visible assistant thinking blocks into another language for display only.
 
-This package is a Pi extension for users who prefer to inspect visible assistant thinking blocks in another language. By default, it only translates `thinking` blocks and does not choose a translator model automatically.
+It renders one translation box directly below each visible assistant thinking block. Translations stay in memory: they are never written to the session file and never enter model context.
 
 ## Features
 
-- Translates a completed `thinking` block when its `thinking_end` event arrives, using the event's full text.
-- Splits the block on newlines, drops empty lines and lines without Latin letters, then translates each remaining line with its own concurrent model request; lines fill in as they arrive and render in original line order.
-- Uses a model already configured in Pi's model registry.
-- Shows one translation box per block below the original assistant message, rendered from a session `custom` entry via `registerEntryRenderer`.
-- Each box shows a `done/total` title plus per-line status: waiting, partial translation while streaming, final translation, or a failure message.
-- Translation entries are written to the session file but never enter future model context, compaction input, or provider cache keys.
-- Supports optional translation of normal assistant `text` answers when explicitly enabled.
-- Supports global config with project-level overrides.
+- Watches `message_update` events and acts only when a thinking block completes (`thinking_end`), using the event's full text.
+- Applies a whole-block gate first: the block must contain at least `minLatinChars` Latin letters, and more Latin letters than Chinese characters.
+- Splits a translatable block on newlines, trims each line, and drops empty lines and lines without Latin letters.
+- Sends every remaining line to the configured translator model as its own concurrent streaming request; lines fill in as they arrive and are placed back in original line order.
+- Renders one translation box below the thinking block it belongs to, via `pi.registerAssistantThinkingRenderer`. Block identity is the normalized full text (uniform newlines, trimmed ends), so the box always attaches to the right block.
+- Each box shows a `思考翻译 · 块 N · done/total` title (N counts thinking blocks within the same message) plus per-line status: waiting, streaming partial text, final text, or a failure message. Late translation updates repaint through the host-provided `requestRender`.
+- Uses a model already configured in omp's model registry; credentials come from the host registry, never from extension-side configuration.
+- Supports a global config with per-project overrides.
+
+## Requirements
+
+- omp (`@oh-my-pi/pi-coding-agent`), verified with 18.1.19. The host build must provide `registerAssistantThinkingRenderer`.
 
 ## Install
 
-This package is not published to npm. Install it from Git:
+This extension is private and is installed from git; it is not published to any package registry.
 
 ```bash
-pi install git:github.com/mouriya-s-lab/pi-thinking-translator
+omp install git:github.com/mouriya-s-lab/pi-thinking-translator
 ```
 
-Pin a tag or commit when you want a fixed version:
+For local development, either load the extension file directly:
 
 ```bash
-pi install git:github.com/mouriya-s-lab/pi-thinking-translator@<tag-or-commit>
+omp -e /absolute/path/to/pi-thinking-translator/extensions/thinking-translator.ts
 ```
 
-For local development from a checkout:
+or install from a local checkout:
 
 ```bash
-pi -e /absolute/path/to/pi-thinking-translator
+omp install /absolute/path/to/pi-thinking-translator
 ```
 
-Requires a Pi build that provides `registerEntryRenderer` (verified with 0.85.1).
+The manifest key is `omp.extensions`, and the pinned `@oh-my-pi/*` 18.1.19 packages live in `devDependencies` only: the host already provides them, so installing this extension adds no `@oh-my-pi` packages under the plugin directory.
 
 ## Quick Start
 
 1. Install the extension:
 
    ```bash
-   pi install git:github.com/mouriya-s-lab/pi-thinking-translator
+   omp install git:github.com/mouriya-s-lab/pi-thinking-translator
    ```
 
-2. Create a global config template from inside Pi:
+2. Create a global config template from inside omp:
 
    ```text
    /thinking-translator init --global
@@ -54,10 +58,10 @@ Requires a Pi build that provides `registerEntryRenderer` (verified with 0.85.1)
 3. Edit the generated file:
 
    ```text
-   ~/.pi/agent/thinking-translator.json
+   ~/.omp/agent/thinking-translator.json
    ```
 
-4. Enable translation and point the extension at a Pi model:
+4. Point the extension at a translator model and enable it:
 
    ```json
    {
@@ -75,7 +79,7 @@ Requires a Pi build that provides `registerEntryRenderer` (verified with 0.85.1)
    /thinking-translator status
    ```
 
-The `provider` and `id` must match a model visible to Pi, for example a model configured in `~/.pi/agent/models.json` or provided by a built-in provider.
+The `provider` and `id` must match a model visible to omp, for example a model from the host model registry. Under `omp --profile <name>`, omp points the agent directory at `~/.omp/profiles/<name>/agent`, so the global config for that profile lives there instead.
 
 ## Commands
 
@@ -89,37 +93,28 @@ The `provider` and `id` must match a model visible to Pi, for example a model co
 
 - `/thinking-translator` and `/thinking-translator status` show the effective config, config file paths, and translator model availability.
 - `/thinking-translator init` creates the global config, same as `/thinking-translator init --global`.
-- `/thinking-translator init --global` creates `~/.pi/agent/thinking-translator.json` if it does not already exist.
-- `/thinking-translator init --project` creates `.pi/thinking-translator.json` in the current project if it does not already exist.
+- `/thinking-translator init --global` creates `<agentDir>/thinking-translator.json` (default `~/.omp/agent/thinking-translator.json`) if it does not already exist.
+- `/thinking-translator init --project` creates `<cwd>/.omp/thinking-translator.json` in the current project if it does not already exist.
 
-The init commands create a disabled template and do not write a default model. You must explicitly set `translatorModel` and enable translation.
+The init commands write a disabled template and do not choose a model. You must explicitly set `translatorModel` and set `enabled` to `true`.
 
 ## Configuration
 
-The extension does not create a config file automatically and does not choose a default translator model. Built-in defaults are used unless you explicitly override them:
+The extension never writes config files on its own; files are created only by the `init` commands, and built-in defaults apply until you override them. Files hold partial overrides that merge over the defaults:
+
+1. Built-in defaults
+2. Global config: `<agentDir>/thinking-translator.json`, where `<agentDir>` is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.omp/agent` (default `~/.omp/agent/thinking-translator.json`)
+3. Project config: `<cwd>/.omp/thinking-translator.json`
+
+The project file is read after the global file, so it wins on every field it sets, including individual `translatorModel` subfields.
+
+A complete config looks like this:
 
 ```json
 {
   "enabled": true,
   "targetLanguage": "Simplified Chinese",
-  "contentTypes": ["thinking"],
-  "minLatinChars": 250
-}
-```
-
-Configuration files are optional partial overrides. They follow Pi's global/project convention:
-
-1. Built-in defaults
-2. Global config: `~/.pi/agent/thinking-translator.json`
-3. Project config: `.pi/thinking-translator.json`
-
-Project config overrides global config.
-
-### Example: global translator model
-
-```json
-{
-  "enabled": true,
+  "minLatinChars": 250,
   "translatorModel": {
     "provider": "deepseek",
     "id": "deepseek-v4-flash"
@@ -127,59 +122,40 @@ Project config overrides global config.
 }
 ```
 
-### Example: enable normal answer translation for one project
-
-Create `.pi/thinking-translator.json` in that project:
-
-```json
-{
-  "contentTypes": ["thinking", "text"]
-}
-```
-
-When `text` is enabled, the translated answer is shown in the same per-block translation box below the assistant message. The extension still leaves the original assistant answer unchanged.
-
 ### Options
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Enables translation processing. If no `translatorModel` is configured, translation is skipped with a warning. |
-| `targetLanguage` | string | `"Simplified Chinese"` | Target language passed to the translator model. |
-| `contentTypes` | string[] | `["thinking"]` | Visible assistant block types to translate. Supported values: `thinking`, `text`. |
-| `minLatinChars` | number | `250` | Minimum number of Latin letters in the whole block text required before the block is considered translatable. |
-| `translatorModel` | object | unset | Pi model reference: `{ "provider": "...", "id": "..." }`. |
+| `targetLanguage` | string | `"Simplified Chinese"` | Target language passed to the translator model. Must be a non-empty string. |
+| `minLatinChars` | number | `250` | Minimum number of Latin letters in the whole thinking block required before the block is considered translatable. The block must also contain more Latin letters than Chinese characters. |
+| `translatorModel` | object | unset | Translator model reference: `{ "provider": "...", "id": "..." }`. Both fields are required for the reference to take effect. |
 
-If translation is enabled but `translatorModel` is missing, cannot be found, or the Pi model registry is unavailable, the extension shows a warning and skips translation without affecting the main assistant message. If a configured model request or credential lookup fails, the extension keeps the original assistant message unchanged and shows a warning for the first occurrence of that error.
+A `contentTypes` key left over from an older config shape is silently ignored; only thinking blocks are translated.
+
+If any config file fails to parse, the extension shows a one-time warning naming that path and forces `enabled` to `false`, so nothing is translated under a broken config. If translation is enabled but `translatorModel` is missing or cannot be found in the host model registry, the extension warns once and skips translation without affecting the main assistant message. A failed translation request leaves the original thinking untouched and surfaces the error inside that line's slot.
 
 ## How It Works
 
-1. During an agent turn, the extension listens to assistant streaming events and acts only on completed blocks: `thinking_end`, plus `text_end` when `text` is in `contentTypes`.
-2. It first applies the whole-block gate: the block must contain at least `minLatinChars` Latin letters, more than its CJK characters.
-3. It splits the block text on newlines, trims each line, and drops empty lines and lines without Latin letters.
-4. It sends every remaining line to the configured Pi model as its own concurrent plain-text translation request; lines fill in as they arrive and render in original line order.
-5. When the assistant message ends, it appends one `thinking-translation` custom entry per block, so each translation box appears below the original assistant message in the session transcript.
-6. Each box shows a `done/total` title plus per-line status: waiting, partial translation while streaming, final translation, or a failure message.
-7. It does not call `sendMessage` or modify the assistant message, so translation entries are written to the session file but never enter future model context, compaction summaries, or branch summaries.
+1. During an agent turn, the extension listens to `message_update` events and ignores everything except `thinking_end`.
+2. It applies the whole-block gate (`minLatinChars` plus the Latin-over-Chinese majority check) to the event's full text.
+3. It splits the text on newlines, trims each line, and keeps only non-empty lines containing Latin letters.
+4. Unless an identical normalized block is already tracked, it records the block under its normalized-text key and fires one independent streaming request per line; each line consumes its own incremental deltas, so a slow line never blocks its siblings, and every line lands back in original order.
+5. The renderer registered with `pi.registerAssistantThinkingRenderer` looks up the visible thinking text by the same normalized key and draws the translation box beneath that block, with a `done/total` title and per-line status.
+6. Every translation arrival or failure calls the host-provided `requestRender`, so boxes that appear while their thinking block is already on screen still fill in and recount automatically.
+7. Translations live only in an in-memory table keyed by normalized text and are dropped on session start, session switch, and session shutdown. Nothing is appended to the session transcript and no translation is ever fed back as model input.
 
-This design lets you inspect translations after each block completes while avoiding display translations becoming future model input or provider cache material.
+## Limitations
+
+- If a thinking block is not visible (for example folded away by the host so it never renders), the host never invokes the translation renderer and no box appears for it.
+- Translations exist only in memory: quitting omp or switching sessions discards them, and previously shown messages are not backfilled when a session reopens.
+- Within one session, two blocks with identical normalized text share a single stored translation.
 
 ## Security Notes
 
-Pi extensions run with full system permissions. Review extension source before installing third-party packages.
+omp extensions run with full system permissions. Review extension source before installing third-party packages.
 
-Translation backends may receive the visible blocks enabled by `contentTypes`, including final assistant answers if `text` is enabled. Use a local model if that content should not leave your machine.
-
-The current implementation stores translations as session `custom` entries (written to the session file but excluded from model context) instead of assistant messages, so display translations do not enter future model context, compaction summaries, or branch summaries.
-
-## Documentation
-
-Pi extension development notes for this repository live in [`docs/`](./docs/README.md):
-
-- [`docs/pi-extension-api.md`](./docs/pi-extension-api.md) — what the Pi extension API can do (every `ExtensionAPI` member, contexts, UI, renderers, providers, and explicit limits).
-- [`docs/pi-extension-events.md`](./docs/pi-extension-events.md) — event timing plus session, LLM context, and compaction boundaries.
-- [`docs/extension-development-guide.md`](./docs/extension-development-guide.md) — end-to-end development flow with a runnable example under [`docs/examples/`](./docs/examples).
-
-All three are written against the locally installed Pi runtime and cite `path:line` evidence.
+Translation backends receive the eligible thinking lines, so use a local model if that content should not leave your machine.
 
 ## Development
 
@@ -188,27 +164,11 @@ pnpm install
 pnpm check
 ```
 
+`pnpm check` runs the TypeScript check plus the test file. Tests run under Bun because the host packages expose TypeScript sources as their entries.
+
 ## Package Layout
 
-```text
-pi-thinking-translator/
-  package.json
-  README.md
-  TODO.md
-  extensions/
-    thinking-translator.ts
-  tests/
-    thinking-translator.test.ts
-  docs/
-    README.md
-    pi-extension-api.md
-    pi-extension-events.md
-    extension-development-guide.md
-    examples/
-      thinking-notes/
-      faux-harness/
-```
-
-## Roadmap
-
-- Add optional API translator backends.
+- `extensions/thinking-translator.ts` — the extension: renderer registration, event handling, translation fan-out, and config commands.
+- `tests/thinking-translator.test.ts` — unit tests for config handling and the translation helpers.
+- `package.json` — private manifest declaring the `omp.extensions` entry and pinned `devDependencies`.
+- `README.md` — this file.

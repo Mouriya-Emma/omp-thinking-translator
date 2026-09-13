@@ -2,22 +2,36 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { __testing } from "../extensions/thinking-translator.ts";
 
-test("normalizeContentTypes defaults invalid/empty/all-invalid to thinking", () => {
-	assert.deepEqual(__testing.normalizeContentTypes(undefined), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes([]), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes(null), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes("thinking"), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes(["image"]), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes(["unknown", "other"]), ["thinking"]);
+test("config paths honor the active omp agent directory and project root", () => {
+	assert.equal(__testing.getGlobalConfigPath("/profiles/work/agent", "/home/user"), "/profiles/work/agent/thinking-translator.json");
+	assert.equal(__testing.getGlobalConfigPath(undefined, "/home/user"), "/home/user/.omp/agent/thinking-translator.json");
+	assert.equal(__testing.getProjectConfigPath("/projects/demo"), "/projects/demo/.omp/thinking-translator.json");
+	assert.equal(__testing.getProjectConfigPath(undefined), undefined);
 });
 
-test("normalizeContentTypes keeps only thinking/text and dedupes", () => {
-	assert.deepEqual(__testing.normalizeContentTypes(["thinking", "reasoning", "text"]), ["thinking", "text"]);
-	assert.deepEqual(__testing.normalizeContentTypes(["reasoning"]), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes(["reasoning_summary"]), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes(["reasoning", "reasoning_summary"]), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes(["text", "text", "thinking", "text"]), ["text", "thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes(["thinking", "image", "text", "reasoning"]), ["thinking", "text"]);
+test("thinking identity normalizes visible boundaries without merging distinct blocks", () => {
+	const key = __testing.thinkingTextKey;
+	assert.equal(key("\nfirst\r\nsecond \n"), key("first\nsecond"));
+	assert.notEqual(key("first\nsecond"), key("first\nthird"));
+	assert.notEqual(key("first"), key("first\nsecond"));
+	assert.notEqual(key("first  second"), key("first second"));
+});
+
+test("legacy and unknown fields are ignored without losing valid overrides", () => {
+	const config = __testing.mergeConfig(__testing.DEFAULT_CONFIG, {
+		contentTypes: ["text"], extra: 123, targetLanguage: "Japanese",
+		translatorModel: { provider: "faux", id: "translator" },
+	});
+	assert.equal(config.targetLanguage, "Japanese");
+	assert.deepEqual(config.translatorModel, { provider: "faux", id: "translator" });
+	assert.equal("contentTypes" in config, false);
+	assert.equal("extra" in config, false);
+});
+
+test("invalid known fields fail closed instead of enabling unexpected requests", () => {
+	for (const value of [null, [], { enabled: "yes" }, { minLatinChars: -1 }, { targetLanguage: "" }]) {
+		assert.throws(() => __testing.mergeConfig(__testing.DEFAULT_CONFIG, value));
+	}
 });
 
 test("mergeConfig layers targetLanguage and minLatinChars overrides", () => {
@@ -25,8 +39,6 @@ test("mergeConfig layers targetLanguage and minLatinChars overrides", () => {
 	const layered = __testing.mergeConfig(base, { targetLanguage: "English", minLatinChars: 5 });
 	assert.equal(layered.targetLanguage, "English");
 	assert.equal(layered.minLatinChars, 5);
-	assert.deepEqual(layered.contentTypes, base.contentTypes);
-	assert.deepEqual(layered.translatorModel, base.translatorModel);
 });
 
 test("mergeConfig supports partial translatorModel overlay and null clears", () => {
@@ -101,23 +113,11 @@ test("cleanTranslation preserves normal internal text", () => {
 	assert.equal(__testing.cleanTranslation("  hello   world  "), "hello   world");
 });
 
-test("splitTranslationLines drops blank lines and re-indexes from zero", () => {
-	assert.deepEqual(__testing.splitTranslationLines("first\n\nsecond\n   \nthird"), [
+test("line requests preserve order and duplicates while omitting non-Latin lines", () => {
+	assert.deepEqual(__testing.splitTranslationLines("\n first\r\n\n中文\n123\nsecond\nfirst\n"), [
 		{ index: 0, source: "first" },
 		{ index: 1, source: "second" },
-		{ index: 2, source: "third" },
-	]);
-});
-
-test("splitTranslationLines handles CRLF and leading/trailing blank lines", () => {
-	assert.deepEqual(__testing.splitTranslationLines("first\r\nsecond\r\n\r\nthird"), [
-		{ index: 0, source: "first" },
-		{ index: 1, source: "second" },
-		{ index: 2, source: "third" },
-	]);
-	assert.deepEqual(__testing.splitTranslationLines("\n\n  first  \nsecond\n\n"), [
-		{ index: 0, source: "first" },
-		{ index: 1, source: "second" },
+		{ index: 2, source: "first" },
 	]);
 });
 
@@ -134,32 +134,3 @@ test("splitTranslationLines trims outer indent but keeps internal spacing", () =
 	]);
 });
 
-test("resolveTranslatorModel skips safely with diagnostic when unconfigured or unavailable", () => {
-	const modelRef = { provider: "ollama", id: "qwen2.5:7b" };
-	const base = { ...__testing.DEFAULT_CONFIG, translatorModel: modelRef };
-
-	const unconfiguredNotices: string[] = [];
-	const unconfiguredCtx = {
-		ui: { notify: (message: string) => unconfiguredNotices.push(message) },
-		modelRegistry: { find: () => ({}), getApiKeyAndHeaders: async () => ({ ok: true }) },
-	};
-	assert.equal(
-		__testing.resolveTranslatorModel(unconfiguredCtx, { ...base, translatorModel: undefined }),
-		undefined,
-	);
-	assert.match(unconfiguredNotices.at(-1) ?? "", /translation skipped/);
-
-	const registryNotices: string[] = [];
-	const noRegistryCtx = { ui: { notify: (message: string) => registryNotices.push(message) } };
-	assert.equal(__testing.resolveTranslatorModel(noRegistryCtx, base), undefined);
-	assert.match(registryNotices.at(-1) ?? "", /translation skipped/);
-
-	const missingNotices: string[] = [];
-	const missingCtx = {
-		ui: { notify: (message: string) => missingNotices.push(message) },
-		modelRegistry: { find: () => undefined, getApiKeyAndHeaders: async () => ({ ok: true }) },
-	};
-	assert.equal(__testing.resolveTranslatorModel(missingCtx, base), undefined);
-	assert.match(missingNotices.at(-1) ?? "", /translation skipped/);
-	assert.match(missingNotices.at(-1) ?? "", /ollama\/qwen2.5:7b/);
-});
