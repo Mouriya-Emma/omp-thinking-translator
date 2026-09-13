@@ -142,7 +142,7 @@ Pi 将这些低层事件映射到扩展事件并在 `_handleAgentEvent()` 中先
 | 事件 | payload 关键字段 | 返回值是否改变行为；同步/异步是否被 await | 典型用法 | 类型与实现证据 |
 |---|---|---|---|---|
 | `message_start` | `message: AgentMessage`（user/assistant/toolResult） | **否**：返回值忽略；逐 handler **await**。 | 创建流式展示或记录消息开始。 | `types.d.ts:591-595,931`；`agent-session.js:494-500`；`agent-loop.js:199-206,51-54` |
-| `message_update` | `message`（assistant 当前 partial）、`assistantMessageEvent` | **否**：返回值忽略；每个 stream update 逐 handler **await**。 | 消费 thinking/text/tool-call 增量，更新外部 UI；不能用 return 改 agent message。 | `types.d.ts:596-601,932`；`agent-session.js:501-507`；示例 `extensions/thinking-translator.ts:99-102` |
+| `message_update` | `message`（assistant 当前 partial）、`assistantMessageEvent` | **否**：返回值忽略；每个 stream update 逐 handler **await**。 | 消费 thinking/text/tool-call 增量，更新外部 UI；不能用 return 改 agent message。 | `types.d.ts:596-601,932`；`agent-session.js:501-507`；示例 `extensions/thinking-translator.ts:112-116` |
 | `message_end` | `message: AgentMessage`（最终消息） | **是**：可返回 `{ message }`，但 role 必须与当前消息相同；多个 handler 链式替换，宿主把最终对象原地同步回 agent state 后再落盘；handler **await**。 | 修正 usage、补 details 或替换同 role 的最终 content。 | `types.d.ts:602-606,841-844,933`；`runner.js:654-692`；`agent-session.js:509-526` |
 | `tool_execution_start` | `toolCallId`、`toolName`、`args` | **否**：返回值忽略；工具执行前逐 handler **await**。 | 显示 pending tool、记录执行开始。 | `types.d.ts:607-613,934`；`agent-session.js:528-536`；`agent-loop.js:261-269,293-303` |
 | `tool_execution_update` | `toolCallId`、`toolName`、`args`、`partialResult` | **否**：返回值忽略；每次 partial update 逐 handler **await**；并行工具时 update 可交错。 | 显示长时间工具的增量输出。 | `types.d.ts:614-621,935`；`agent-session.js:537-546`；`agent-loop.js:460-477` |
@@ -193,13 +193,13 @@ Pi 将这些低层事件映射到扩展事件并在 `_handleAgentEvent()` 中先
 
 ### 3.2 仓库中的消费例子
 
-仓库 `extensions/thinking-translator.ts:369-450` 是一个不改写原消息的真实消费者：
+仓库 `extensions/thinking-translator.ts:103-164` 是一个不改写原消息的真实消费者：
 
-- `start` 增加 assistant serial 并清空旧 block 状态（`:376-379`）；`done/error` 清理状态（`:381-384`）。
-- `thinking_delta` 读取 `event.delta` 并累加，`thinking_end` 读取 `event.content` 覆盖为权威全量（`:409-423`）。
-- `contentIndex` 被拼进 block key，区分一条 assistant 消息里的多个 block（`:433-449`）。
+- `message_start` 为每条 assistant 消息建立流式状态并分配 serial（`:103-111`）；`message_end` 把暂存的译文框按 ordinal 排序后 `appendEntry`，再回到 idle（`:117-124`）。
+- 只消费 `thinking_end` / `text_end` 的权威全量 `event.content`，不累加 `thinking_delta`（`:112-116`、`:145-164`）。
+- `contentIndex` 被拼进 block key，区分一条 assistant 消息里的多个 block（`:150`）。
 - handler 只消费 `event.assistantMessageEvent`，不通过 `message_update` return 改 agent message：
-  `extensions/thinking-translator.ts:99-102`。
+  `extensions/thinking-translator.ts:112-116`。
 
 这是“观察流式数据并另行展示”的正确边界；如果扩展想更新自己返回的 UI 组件，应让组件的
 `render()` 读取可变状态，并在需要时显式请求重绘，而不是期待 renderer 工厂再次被调用。
@@ -269,8 +269,8 @@ handler 会拦住摘要请求。当前代码对摘要 provider 是否触发某�
 
 [运行时观察] 流式结束后扩展才收到的迟到状态更新没有这个内建触发器；要调用
 `ctx.ui.setStatus()`（其实现会 `ui.requestRender()`，`dist/modes/interactive/interactive-mode.js:1616-1619`），
-或者在自定义组件中保留 `tui` 并调用 `tui.requestRender()`。仓库实现正是这样做的：
-`extensions/thinking-translator.ts:539-548`。
+或者在自定义组件中保留 `tui` 并调用 `tui.requestRender()`。仓库实现用的是前一种：流式期间直接返回、只在流式结束后用 `ctx.ui.setStatus()` 触发迟到重绘：
+`extensions/thinking-translator.ts:206-210`。
 
 ## 6. 多扩展共存、结果合并和错误隔离
 
@@ -368,13 +368,13 @@ process/socket/file watcher/timer；在 `session_start` 或真正需要它的 co
 在幂等的 `session_shutdown` 中释放：`docs/extensions.md:220-224`。
 
 请求本身应使用 handler 的 `ctx.signal`；compaction/tree event 也提供自己的 `signal`。例如
-`thinking-translator` 将翻译 provider stream 绑定到 `ctx.signal`：`extensions/thinking-translator.ts:478-490`，
-并在 `session_start`、`agent_start`、`session_shutdown` 清掉展示 epoch、状态 Map 和 timer：
-`extensions/thinking-translator.ts:89-107,624-646`。
+`thinking-translator` 将翻译 provider stream 绑定到 `ctx.signal`：`extensions/thinking-translator.ts:179-182`，
+并在 `session_start`、`agent_start`、`session_shutdown` 用 `invalidateTranslations()` 推进 epoch、清空 block 状态和通知去重集合：
+`extensions/thinking-translator.ts:97-102,125-127,213-220`。
 
 ### 为什么模块级全局变量会“跳车”
 
-`thinking-translator.ts:56-70` 的 Map、序列号、timer 和 TUI 引用都是 module-level state；它们
+`thinking-translator.ts:53-60` 的 block Map、通知去重集合、epoch、assistant 序列号和当前消息状态都是 module-level state；它们
 属于某次 extension module/runtime，而不是 session entry。reload 或 session replacement 会创建新
 runtime，新 instance 不会自动接管旧 module 的内存状态；旧 handler 仍可能有在途 Promise，故必须
 用 shutdown 清理并用 epoch/AbortSignal 让迟到结果失效。若状态必须跨 reload/resume，应写入
@@ -451,7 +451,7 @@ runtime，新 instance 不会自动接管旧 module 的内存状态；旧 handle
 - 官方示例 `custom-compaction.ts`、`trigger-compact.ts`、`git-checkpoint.ts`、`bookmark.ts`、
   `event-bus.ts`、`file-trigger.ts`、`permission-gate.ts`、`input-transform.ts`、
   `input-transform-streaming.ts`、`send-user-message.ts`、`handoff.ts`；
-- 仓库 `extensions/thinking-translator.ts:56-70,89-107,369-450,478-548,624-646`。
+- 仓库 `extensions/thinking-translator.ts:53-60,64-127,131-225,433-438`。
 
 明确标为 **Unverified** 的只有两类：默认摘要请求是否在每个 provider 实现上触发某些底层 transport
 hook（本文只证明它绕过 `emitContext`），以及某个外部 RPC host 是否自行执行 TUI renderer。其余

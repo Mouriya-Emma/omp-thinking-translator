@@ -2,43 +2,91 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { __testing } from "../extensions/thinking-translator.ts";
 
-const baseConfig = {
-	...__testing.DEFAULT_CONFIG,
-	contentTypes: ["thinking"] as Array<"thinking" | "reasoning" | "reasoning_summary" | "text">,
-};
-
-test("built-in defaults do not choose a translator model", () => {
-	assert.equal(__testing.DEFAULT_CONFIG.translatorModel, undefined);
-	assert.equal(__testing.DEFAULT_CONFIG.enabled, true);
-});
-
-test("normalizeContentTypes keeps thinking-only default safe", () => {
+test("normalizeContentTypes defaults invalid/empty/all-invalid to thinking", () => {
 	assert.deepEqual(__testing.normalizeContentTypes(undefined), ["thinking"]);
 	assert.deepEqual(__testing.normalizeContentTypes([]), ["thinking"]);
-	assert.deepEqual(__testing.normalizeContentTypes(["text", "image", "text"]), ["text"]);
+	assert.deepEqual(__testing.normalizeContentTypes(null), ["thinking"]);
+	assert.deepEqual(__testing.normalizeContentTypes("thinking"), ["thinking"]);
+	assert.deepEqual(__testing.normalizeContentTypes(["image"]), ["thinking"]);
+	assert.deepEqual(__testing.normalizeContentTypes(["unknown", "other"]), ["thinking"]);
 });
 
-test("mergeConfig supports partial global and project overrides", () => {
-	const globalConfig = __testing.mergeConfig(__testing.DEFAULT_CONFIG, {
+test("normalizeContentTypes keeps only thinking/text and dedupes", () => {
+	assert.deepEqual(__testing.normalizeContentTypes(["thinking", "reasoning", "text"]), ["thinking", "text"]);
+	assert.deepEqual(__testing.normalizeContentTypes(["reasoning"]), ["thinking"]);
+	assert.deepEqual(__testing.normalizeContentTypes(["reasoning_summary"]), ["thinking"]);
+	assert.deepEqual(__testing.normalizeContentTypes(["reasoning", "reasoning_summary"]), ["thinking"]);
+	assert.deepEqual(__testing.normalizeContentTypes(["text", "text", "thinking", "text"]), ["text", "thinking"]);
+	assert.deepEqual(__testing.normalizeContentTypes(["thinking", "image", "text", "reasoning"]), ["thinking", "text"]);
+});
+
+test("mergeConfig layers targetLanguage and minLatinChars overrides", () => {
+	const base = { ...__testing.DEFAULT_CONFIG };
+	const layered = __testing.mergeConfig(base, { targetLanguage: "English", minLatinChars: 5 });
+	assert.equal(layered.targetLanguage, "English");
+	assert.equal(layered.minLatinChars, 5);
+	assert.deepEqual(layered.contentTypes, base.contentTypes);
+	assert.deepEqual(layered.translatorModel, base.translatorModel);
+});
+
+test("mergeConfig supports partial translatorModel overlay and null clears", () => {
+	const baseWithModel = __testing.mergeConfig(__testing.DEFAULT_CONFIG, {
 		translatorModel: { provider: "ollama", id: "qwen2.5:7b" },
-		contentTypes: ["thinking", "text"],
 	});
-	const projectConfig = __testing.mergeConfig(globalConfig, {
-		translatorModel: { provider: "ollama", id: "qwen3:8b" },
+	const providerOverlay = __testing.mergeConfig(baseWithModel, {
+		translatorModel: { provider: "openai" },
 	});
-	assert.deepEqual(projectConfig.translatorModel, { provider: "ollama", id: "qwen3:8b" });
-	assert.deepEqual(projectConfig.contentTypes, ["thinking", "text"]);
+	assert.deepEqual(providerOverlay.translatorModel, { provider: "openai", id: "qwen2.5:7b" });
+	const idOverlay = __testing.mergeConfig(baseWithModel, {
+		translatorModel: { id: "gpt-4o-mini" },
+	});
+	assert.deepEqual(idOverlay.translatorModel, { provider: "ollama", id: "gpt-4o-mini" });
+	const cleared = __testing.mergeConfig(baseWithModel, { translatorModel: null });
+	assert.equal(cleared.translatorModel, undefined);
+	const preserved = __testing.mergeConfig(baseWithModel, {});
+	assert.deepEqual(preserved.translatorModel, { provider: "ollama", id: "qwen2.5:7b" });
 });
 
-test("getTranslatableBlockSource respects configured content types", () => {
-	assert.deepEqual(__testing.getTranslatableBlockSource({ type: "thinking", thinking: "Need to inspect files" }, baseConfig), {
-		type: "thinking", field: "thinking", text: "Need to inspect files",
-	});
-	assert.equal(__testing.getTranslatableBlockSource({ type: "text", text: "Normal answer" }, baseConfig), undefined);
+test("normalizeTranslatorModel falls back on undefined and clears on null", () => {
+	const fallback = { provider: "ollama", id: "qwen2.5:7b" };
+	assert.deepEqual(__testing.normalizeTranslatorModel(undefined, fallback), fallback);
+	assert.equal(__testing.normalizeTranslatorModel(undefined), undefined);
+	assert.equal(__testing.normalizeTranslatorModel(null, fallback), undefined);
+	assert.equal(__testing.normalizeTranslatorModel(null), undefined);
 	assert.deepEqual(
-		__testing.getTranslatableBlockSource({ type: "text", text: "Normal answer" }, { ...baseConfig, contentTypes: ["thinking", "text"] }),
-		{ type: "text", field: "text", text: "Normal answer" },
+		__testing.normalizeTranslatorModel({ provider: "openai" }, fallback),
+		{ provider: "openai", id: "qwen2.5:7b" },
 	);
+	assert.deepEqual(
+		__testing.normalizeTranslatorModel({ id: "gpt-4o-mini" }, fallback),
+		{ provider: "ollama", id: "gpt-4o-mini" },
+	);
+});
+
+test("normalizeTranslatorModel rejects incomplete or non-object models", () => {
+	assert.equal(__testing.normalizeTranslatorModel({ provider: "ollama" }), undefined);
+	assert.equal(__testing.normalizeTranslatorModel({ id: "qwen2.5:7b" }), undefined);
+	assert.equal(__testing.normalizeTranslatorModel({}), undefined);
+	assert.equal(__testing.normalizeTranslatorModel("ollama"), undefined);
+	assert.equal(__testing.normalizeTranslatorModel(123), undefined);
+	assert.deepEqual(__testing.normalizeTranslatorModel({ provider: "ollama", id: "qwen2.5:7b" }), {
+		provider: "ollama",
+		id: "qwen2.5:7b",
+	});
+});
+
+test("shouldTranslate passes at threshold and fails below", () => {
+	const config = { ...__testing.DEFAULT_CONFIG, minLatinChars: 10 };
+	assert.equal(__testing.shouldTranslate("a".repeat(10), config), true);
+	assert.equal(__testing.shouldTranslate("a".repeat(9), config), false);
+	assert.equal(__testing.shouldTranslate("", config), false);
+});
+
+test("shouldTranslate requires Latin dominance over CJK", () => {
+	const config = { ...__testing.DEFAULT_CONFIG, minLatinChars: 5 };
+	assert.equal(__testing.shouldTranslate("abcde你好", config), true);
+	assert.equal(__testing.shouldTranslate("abcde你好啊你好", config), false);
+	assert.equal(__testing.shouldTranslate("abcde你好啊你好啊", config), false);
 });
 
 test("cleanTranslation removes common model wrappers", () => {
@@ -47,105 +95,71 @@ test("cleanTranslation removes common model wrappers", () => {
 	assert.equal(__testing.cleanTranslation("<text>\n你好\n</text>"), "你好");
 });
 
-test("getAssistantMessageForTranslation keeps only finished assistant messages", () => {
-	const assistant = { role: "assistant", content: [{ type: "thinking", thinking: "Need to inspect" }] };
-	assert.deepEqual(__testing.getAssistantMessageForTranslation(assistant), assistant);
-	assert.equal(__testing.getAssistantMessageForTranslation({ role: "user", content: [] }), undefined);
-	assert.equal(__testing.getAssistantMessageForTranslation({ role: "assistant", content: null }), undefined);
+test("cleanTranslation preserves normal internal text", () => {
+	assert.equal(__testing.cleanTranslation("hello   world"), "hello   world");
+	assert.equal(__testing.cleanTranslation("first line\nsecond   line"), "first line\nsecond   line");
+	assert.equal(__testing.cleanTranslation("  hello   world  "), "hello   world");
 });
 
-test("isThinkingTitleLine detects short title followed by blank line", () => {
-	const lines = ["Searching for plugins", "", "I should inspect the filesystem first."];
-	assert.equal(__testing.isThinkingTitleLine(lines, 0), true);
-	assert.equal(__testing.isThinkingTitleLine(["This line is intentionally much longer than forty characters and should not count", "", "Body"], 0), false);
-	assert.equal(__testing.isThinkingTitleLine(["Body before", "Searching for plugins", "", "Body after"], 1), false);
-});
-
-test("isShortTitleParagraph keeps only short single-line paragraphs as titles", () => {
-	assert.equal(__testing.isShortTitleParagraph("Searching for plugins"), true);
-	assert.equal(__testing.isShortTitleParagraph("Searching for plugins\nMore"), false);
-	assert.equal(__testing.isShortTitleParagraph("This paragraph is intentionally much longer than forty characters and should not count"), false);
-});
-
-test("splitThinkingSections groups title and body into one section", () => {
-	const text = ["Searching for plugins", "", "I should inspect the filesystem first.", "", "Locating the plugin", "", "I found a likely repository path."].join("\n");
-	assert.deepEqual(__testing.splitThinkingSections(text), [
-		["Searching for plugins", "", "I should inspect the filesystem first."].join("\n"),
-		["Locating the plugin", "", "I found a likely repository path."].join("\n"),
+test("splitTranslationLines drops blank lines and re-indexes from zero", () => {
+	assert.deepEqual(__testing.splitTranslationLines("first\n\nsecond\n   \nthird"), [
+		{ index: 0, source: "first" },
+		{ index: 1, source: "second" },
+		{ index: 2, source: "third" },
 	]);
 });
 
-test("getCompletedThinkingSections excludes trailing unfinished section", () => {
-	const text = ["Searching for plugins", "", "I should inspect the filesystem first.", "", "Locating the plugin", "", "I found a likely repository path."].join("\n");
-	assert.deepEqual(__testing.getCompletedThinkingSections(text, false), [["Searching for plugins", "", "I should inspect the filesystem first."].join("\n")]);
-	assert.deepEqual(__testing.getCompletedThinkingSections(text, true), [
-		["Searching for plugins", "", "I should inspect the filesystem first."].join("\n"),
-		["Locating the plugin", "", "I found a likely repository path."].join("\n"),
+test("splitTranslationLines handles CRLF and leading/trailing blank lines", () => {
+	assert.deepEqual(__testing.splitTranslationLines("first\r\nsecond\r\n\r\nthird"), [
+		{ index: 0, source: "first" },
+		{ index: 1, source: "second" },
+		{ index: 2, source: "third" },
+	]);
+	assert.deepEqual(__testing.splitTranslationLines("\n\n  first  \nsecond\n\n"), [
+		{ index: 0, source: "first" },
+		{ index: 1, source: "second" },
 	]);
 });
 
-test("formatTranslationWidgetLines wraps long CJK lines instead of truncating", () => {
-	const width = 20;
-	const future = Date.now() + 60_000;
-	const result = __testing.formatTranslationWidgetLines([{ text: "这是一段很长的中文翻译内容", expiresAt: future }], width);
-	assert.ok(result[0]?.includes("思考翻译"), `标题应包含"思考翻译": ${result[0]}`);
-	assert.ok(result.length > 2, `长中文应有多行，实际 ${result.length}`);
+test("splitTranslationLines returns empty for all-whitespace input", () => {
+	assert.deepEqual(__testing.splitTranslationLines("   \n \t \n  "), []);
+	assert.deepEqual(__testing.splitTranslationLines(""), []);
 });
 
-test("formatTranslationWidgetLines wraps mixed CJK+ASCII correctly", () => {
-	const width = 30;
-	const future = Date.now() + 60_000;
-	const result = __testing.formatTranslationWidgetLines([{ text: "需要检查 plugin 配置文件是否正确加载", expiresAt: future }], width);
-	const bodyLines = result.slice(1);
-	assert.ok(bodyLines.length >= 2, `应该至少有 2 行正文，实际 ${bodyLines.length}`);
+test("splitTranslationLines trims outer indent but keeps internal spacing", () => {
+	assert.deepEqual(__testing.splitTranslationLines("  hello   world  "), [{ index: 0, source: "hello   world" }]);
+	assert.deepEqual(__testing.splitTranslationLines("  foo  bar  \n  baz   qux  "), [
+		{ index: 0, source: "foo  bar" },
+		{ index: 1, source: "baz   qux" },
+	]);
 });
 
-test("formatTranslationWidgetLines returns empty when no active entries", () => {
-	const past = Date.now() - 1000;
-	assert.deepEqual(__testing.formatTranslationWidgetLines([{ text: "过期", expiresAt: past }], 80), []);
-});
+test("resolveTranslatorModel skips safely with diagnostic when unconfigured or unavailable", () => {
+	const modelRef = { provider: "ollama", id: "qwen2.5:7b" };
+	const base = { ...__testing.DEFAULT_CONFIG, translatorModel: modelRef };
 
-test("formatTranslationWidgetLines renders widget from history array", () => {
-	const width = 80;
-	const future = Date.now() + 60_000;
-	const mk = (text: string) => ({ text, expiresAt: future });
+	const unconfiguredNotices: string[] = [];
+	const unconfiguredCtx = {
+		ui: { notify: (message: string) => unconfiguredNotices.push(message) },
+		modelRegistry: { find: () => ({}), getApiKeyAndHeaders: async () => ({ ok: true }) },
+	};
+	assert.equal(
+		__testing.resolveTranslatorModel(unconfiguredCtx, { ...base, translatorModel: undefined }),
+		undefined,
+	);
+	assert.match(unconfiguredNotices.at(-1) ?? "", /translation skipped/);
 
-	// 标题 + 2 行正文 = 3 行
-	const result = __testing.formatTranslationWidgetLines([mk("第一段\n第二行")], width);
-	assert.equal(result.length, 3);
-	assert.ok(result[0]?.includes("思考翻译"));
-	assert.equal(result[1], "第一段");
-	assert.equal(result[2], "第二行");
+	const registryNotices: string[] = [];
+	const noRegistryCtx = { ui: { notify: (message: string) => registryNotices.push(message) } };
+	assert.equal(__testing.resolveTranslatorModel(noRegistryCtx, base), undefined);
+	assert.match(registryNotices.at(-1) ?? "", /translation skipped/);
 
-	// 超过 20 行正文时只保留最后 20 行
-	const many = Array.from({ length: 30 }, (_, i) => mk(`行${i + 1}`));
-	const resultMany = __testing.formatTranslationWidgetLines(many, width);
-	assert.equal(resultMany.length, 21); // 标题 + 20 行正文
-	assert.ok(resultMany[0]?.includes("思考翻译"));
-	assert.equal(resultMany[1], "行11");
-	assert.equal(resultMany[20], "行30");
-});
-
-test("formatTranslationWidgetLines filters expired entries", () => {
-	const width = 80;
-	const past = Date.now() - 1000;
-	const future = Date.now() + 60_000;
-	const entries = [{ text: "过期文本", expiresAt: past }, { text: "有效文本", expiresAt: future }];
-	const result = __testing.formatTranslationWidgetLines(entries, width);
-	assert.equal(result.length, 2); // 标题 + 1 行正文
-	assert.equal(result[1], "有效文本");
-});
-
-test("resolveTranslatorModel skips safely when registry or model is unavailable", () => {
-	const notices: string[] = [];
-	const ctxWithoutRegistry = { ui: { notify: (message: string) => notices.push(message) } };
-	assert.equal(__testing.resolveTranslatorModel(ctxWithoutRegistry, { ...baseConfig, translatorModel: { provider: "missing", id: "model" } }), undefined);
-	assert.match(notices.at(-1) ?? "", /model registry is unavailable/);
-
-	const ctxWithMissingModel = {
-		ui: { notify: (message: string) => notices.push(message) },
+	const missingNotices: string[] = [];
+	const missingCtx = {
+		ui: { notify: (message: string) => missingNotices.push(message) },
 		modelRegistry: { find: () => undefined, getApiKeyAndHeaders: async () => ({ ok: true }) },
 	};
-	assert.equal(__testing.resolveTranslatorModel(ctxWithMissingModel, { ...baseConfig, translatorModel: { provider: "missing", id: "model" } }), undefined);
-	assert.match(notices.at(-1) ?? "", /model not found: missing\/model/);
+	assert.equal(__testing.resolveTranslatorModel(missingCtx, base), undefined);
+	assert.match(missingNotices.at(-1) ?? "", /translation skipped/);
+	assert.match(missingNotices.at(-1) ?? "", /ollama\/qwen2.5:7b/);
 });

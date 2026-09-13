@@ -435,7 +435,7 @@ models，恢复被覆盖的 built-in models；未注册时无效果。证据：
    `@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox`）按官方 package
    contract 应列在 `peerDependencies: { "*" }` 而不是打包进去；第三方 runtime dependency
    应列 `dependencies`（`docs/packages.md §Dependencies`）。
-4. **本仓库的具体注意点。** `extensions/thinking-translator.ts:4-7` 确实 import 了
+4. **本仓库的具体注意点。** `extensions/thinking-translator.ts:5-9` 确实 import 了
    `@earendil-works/pi-ai`、`@earendil-works/pi-coding-agent` 和 `@earendil-works/pi-tui`；
    但仓库 `package.json:40-47` 只把前两个列入 peerDependencies，把 `@earendil-works/pi-tui`
    列作 `devDependencies`。这只保证本地类型检查依赖，不会让发布包的 production install

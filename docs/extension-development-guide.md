@@ -151,7 +151,7 @@ $ node -e 'const p=require("./package.json"); console.log(JSON.stringify({files:
 }
 ```
 
-这就是发布 package 时应参照的真实结构：现有 `extensions/thinking-translator.ts` 是仓库根下的单一扩展，纯逻辑测试通过 `__testing` 导出对象暴露（仓库 `extensions/thinking-translator.ts:799-820`）。本次示例放在 `docs/examples/` 是文档示例，不会因为放在那里就自动成为当前 package 的发布资源。
+这就是发布 package 时应参照的真实结构：现有 `extensions/thinking-translator.ts` 是仓库根下的单一扩展，纯逻辑测试通过 `__testing` 导出对象暴露（仓库 `extensions/thinking-translator.ts:466-479`）。本次示例放在 `docs/examples/` 是文档示例，不会因为放在那里就自动成为当前 package 的发布资源。
 
 ## 3. 本地加载与热重载
 
