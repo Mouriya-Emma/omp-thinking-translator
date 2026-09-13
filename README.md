@@ -171,6 +171,16 @@ Translation backends may receive the visible blocks enabled by `contentTypes`, i
 
 The current implementation displays translations through a temporary widget instead of assistant messages, so display translations do not enter future model context or compaction summaries.
 
+## Documentation
+
+Pi extension development notes for this repository live in [`docs/`](./docs/README.md):
+
+- [`docs/pi-extension-api.md`](./docs/pi-extension-api.md) — what the Pi extension API can do (every `ExtensionAPI` member, contexts, UI, renderers, providers, and explicit limits).
+- [`docs/pi-extension-events.md`](./docs/pi-extension-events.md) — event timing plus session, LLM context, and compaction boundaries.
+- [`docs/extension-development-guide.md`](./docs/extension-development-guide.md) — end-to-end development flow with a runnable example under [`docs/examples/`](./docs/examples).
+
+All three are written against the locally installed Pi runtime and cite `path:line` evidence. They are excluded from the npm tarball by the `files` whitelist.
+
 ## Development
 
 ```bash
@@ -189,6 +199,14 @@ pi-thinking-translator/
     thinking-translator.ts
   tests/
     thinking-translator.test.ts
+  docs/
+    README.md
+    pi-extension-api.md
+    pi-extension-events.md
+    extension-development-guide.md
+    examples/
+      thinking-notes/
+      faux-harness/
 ```
 
 ## Roadmap
