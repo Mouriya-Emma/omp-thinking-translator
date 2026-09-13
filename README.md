@@ -1,4 +1,4 @@
-# Thinking Translator
+# omp-thinking-translator
 
 An omp extension that translates visible assistant thinking blocks into another language for display only.
 
@@ -18,24 +18,26 @@ It renders one translation box directly below each visible assistant thinking bl
 
 - omp (`@oh-my-pi/pi-coding-agent`), verified with 18.1.19. The host build must provide `registerAssistantThinkingRenderer`.
 
+This extension is omp-only, not a pi extension. It is built on omp's extension API: the translation box attaches through `pi.registerAssistantThinkingRenderer`, which upstream pi does not provide, and every import resolves against omp's `@oh-my-pi/*` packages rather than pi's own. Running it on pi would mean a different display surface, not a configuration change.
+
 ## Install
 
-This extension is private and is installed from git; it is not published to any package registry.
+This extension is installed from git; it is not published to any package registry.
 
 ```bash
-omp install git:github.com/mouriya-s-lab/pi-thinking-translator
+omp install git:github.com/Mouriya-Emma/omp-thinking-translator
 ```
 
 For local development, either load the extension file directly:
 
 ```bash
-omp -e /absolute/path/to/pi-thinking-translator/extensions/thinking-translator.ts
+omp -e /absolute/path/to/omp-thinking-translator/extensions/thinking-translator.ts
 ```
 
 or install from a local checkout:
 
 ```bash
-omp install /absolute/path/to/pi-thinking-translator
+omp install /absolute/path/to/omp-thinking-translator
 ```
 
 The manifest key is `omp.extensions`, and the pinned `@oh-my-pi/*` 18.1.19 packages live in `devDependencies` only: the host already provides them, so installing this extension adds no `@oh-my-pi` packages under the plugin directory.
@@ -45,7 +47,7 @@ The manifest key is `omp.extensions`, and the pinned `@oh-my-pi/*` 18.1.19 packa
 1. Install the extension:
 
    ```bash
-   omp install git:github.com/mouriya-s-lab/pi-thinking-translator
+   omp install git:github.com/Mouriya-Emma/omp-thinking-translator
    ```
 
 2. Create a global config template from inside omp:
@@ -170,5 +172,5 @@ pnpm check
 
 - `extensions/thinking-translator.ts` — the extension: renderer registration, event handling, translation fan-out, and config commands.
 - `tests/thinking-translator.test.ts` — unit tests for config handling and the translation helpers.
-- `package.json` — private manifest declaring the `omp.extensions` entry and pinned `devDependencies`.
+- `package.json` — manifest declaring the `omp.extensions` entry and pinned `devDependencies`.
 - `README.md` — this file.

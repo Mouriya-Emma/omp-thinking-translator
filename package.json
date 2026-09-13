@@ -1,16 +1,16 @@
 {
-  "name": "pi-thinking-translator",
+  "name": "omp-thinking-translator",
   "version": "0.3.0",
   "description": "omp extension for translating visible assistant thinking blocks.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mouriya-s-lab/pi-thinking-translator.git"
+    "url": "git+https://github.com/Mouriya-Emma/omp-thinking-translator.git"
   },
-  "homepage": "https://github.com/mouriya-s-lab/pi-thinking-translator#readme",
+  "homepage": "https://github.com/Mouriya-Emma/omp-thinking-translator#readme",
   "bugs": {
-    "url": "https://github.com/mouriya-s-lab/pi-thinking-translator/issues"
+    "url": "https://github.com/Mouriya-Emma/omp-thinking-translator/issues"
   },
   "private": true,
   "keywords": [
