@@ -9,12 +9,10 @@ test("config paths honor the active omp agent directory and project root", () =>
 	assert.equal(__testing.getProjectConfigPath(undefined), undefined);
 });
 
-test("thinking identity normalizes visible boundaries without merging distinct blocks", () => {
-	const key = __testing.thinkingTextKey;
-	assert.equal(key("\nfirst\r\nsecond \n"), key("first\nsecond"));
-	assert.notEqual(key("first\nsecond"), key("first\nthird"));
-	assert.notEqual(key("first"), key("first\nsecond"));
-	assert.notEqual(key("first  second"), key("first second"));
+test("completedLines withholds the still-growing trailing line", () => {
+	assert.deepEqual(__testing.completedLines("first\nsecond\nthi"), ["first", "second"]);
+	assert.deepEqual(__testing.completedLines("first\nsecond\n"), ["first", "second"]);
+	assert.deepEqual(__testing.completedLines("only one partial line"), []);
 });
 
 test("legacy and unknown fields are ignored without losing valid overrides", () => {
@@ -114,11 +112,7 @@ test("cleanTranslation preserves normal internal text", () => {
 });
 
 test("line requests preserve order and duplicates while omitting non-Latin lines", () => {
-	assert.deepEqual(__testing.splitTranslationLines("\n first\r\n\n中文\n123\nsecond\nfirst\n"), [
-		{ index: 0, source: "first" },
-		{ index: 1, source: "second" },
-		{ index: 2, source: "first" },
-	]);
+	assert.deepEqual(__testing.splitTranslationLines("\n first\r\n\n中文\n123\nsecond\nfirst\n"), ["first", "second", "first"]);
 });
 
 test("splitTranslationLines returns empty for all-whitespace input", () => {
@@ -127,10 +121,7 @@ test("splitTranslationLines returns empty for all-whitespace input", () => {
 });
 
 test("splitTranslationLines trims outer indent but keeps internal spacing", () => {
-	assert.deepEqual(__testing.splitTranslationLines("  hello   world  "), [{ index: 0, source: "hello   world" }]);
-	assert.deepEqual(__testing.splitTranslationLines("  foo  bar  \n  baz   qux  "), [
-		{ index: 0, source: "foo  bar" },
-		{ index: 1, source: "baz   qux" },
-	]);
+	assert.deepEqual(__testing.splitTranslationLines("  hello   world  "), ["hello   world"]);
+	assert.deepEqual(__testing.splitTranslationLines("  foo  bar  \n  baz   qux  "), ["foo  bar", "baz   qux"]);
 });
 

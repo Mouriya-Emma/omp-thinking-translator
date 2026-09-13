@@ -7,13 +7,12 @@ import { getMarkdownTheme } from "@oh-my-pi/pi-coding-agent";
 import { Box, Markdown, Text } from "@oh-my-pi/pi-tui";
 
 type ModelRef = { provider: string; id: string };
-type TranslationLineSource = { index: number; source: string };
 type TranslationProgress =
 	| { status: "pending" }
 	| { status: "streaming" | "done"; translation: string }
 	| { status: "error"; error: string };
-type TranslationLine = TranslationLineSource & { progress: TranslationProgress };
-type TranslationBlock = { lines: TranslationLine[] };
+/** 一行一个共享状态格；文本相同的行共用同一次请求。 */
+type TranslationCell = { progress: TranslationProgress };
 type ResolvedTranslatorConfig = {
 	enabled: boolean;
 	targetLanguage: string;
@@ -41,12 +40,15 @@ let missingModelWarningKey: string | undefined;
 
 /** 译文只附着在可见 thinking 下方，不写入会话或模型上下文。 */
 export default function thinkingTranslator(pi: ExtensionAPI) {
-	const liveBlocks = new Map<string, TranslationBlock>();
+	// 以行文本为身份：宿主展示的 thinking 会折叠代码围栏与注释噪声，整块文本做键会错配。
+	const translations = new Map<string, TranslationCell>();
+	let cachedConfig: ResolvedTranslatorConfig | undefined;
 	let requestRender: (() => void) | undefined;
 	let controller = new AbortController();
 
 	pi.registerAssistantThinkingRenderer((context, theme) => {
-		const key = thinkingTextKey(context.text);
+		// thinking 文本每次变化都会重建组件，工厂期的拆分就是当前可见行。
+		const sources = splitTranslationLines(context.text);
 		requestRender = context.requestRender;
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		const title = new Text("", 0, 0);
@@ -55,14 +57,18 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		box.addChild(body);
 		return {
 			render(width: number): readonly string[] {
-				const data = liveBlocks.get(key);
-				if (!data) return [];
-				let completed = 0;
-				for (const line of data.lines) {
-					if (line.progress.status === "done" || line.progress.status === "error") completed++;
+				const cells: TranslationCell[] = [];
+				for (const source of sources) {
+					const cell = translations.get(source);
+					if (cell) cells.push(cell);
 				}
-				title.setText(theme.fg("accent", `思考翻译 · 块 ${context.thinkingIndex + 1} · ${completed}/${data.lines.length}`));
-				body.setText(data.lines.map(formatTranslationLine).join("\n\n"));
+				if (cells.length === 0) return [];
+				let completed = 0;
+				for (const cell of cells) {
+					if (cell.progress.status === "done" || cell.progress.status === "error") completed++;
+				}
+				title.setText(theme.fg("accent", `思考翻译 · 块 ${context.thinkingIndex + 1} · ${completed}/${cells.length}`));
+				body.setText(cells.map(formatTranslationCell).join("\n\n"));
 				return box.render(width);
 			},
 			invalidate(): void {
@@ -80,11 +86,12 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		handler: handleConfigCommand,
 	});
 
-	/** 切换会话时中止旧请求；新一轮对话保留已显示的译文。 */
+	/** 切换会话时中止旧请求并丢弃译文缓存。 */
 	function resetTranslations(): void {
 		controller.abort();
 		controller = new AbortController();
-		liveBlocks.clear();
+		translations.clear();
+		cachedConfig = undefined;
 		configErrorNotified.clear();
 		requestRender = undefined;
 		translationFailureNotified.clear();
@@ -94,44 +101,66 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	pi.on("session_switch", resetTranslations);
 	pi.on("session_shutdown", resetTranslations);
 
-	pi.on("message_update", (event, ctx) => {
-		const blockEvent = event.assistantMessageEvent;
-		if (blockEvent.type !== "thinking_end") return;
-		const config = loadConfig(ctx);
-		if (!config.enabled || !shouldTranslate(blockEvent.content, config)) return;
-		const key = thinkingTextKey(blockEvent.content);
-		if (liveBlocks.has(key)) return;
-		const lines: TranslationLine[] = splitTranslationLines(blockEvent.content)
-			.map((line) => ({ ...line, progress: { status: "pending" } }));
-		if (lines.length === 0) return;
+	// thinking 增量事件太密，配置每条消息只读一次盘。
+	pi.on("message_start", () => {
+		cachedConfig = undefined;
+	});
+
+	/** 同一行文本只请求一次；建格后立即发起请求。 */
+	function ensureTranslation(source: string, ctx: ExtensionContext, config: ResolvedTranslatorConfig, model: Model<Api>): void {
+		if (translations.has(source)) return;
+		const cell: TranslationCell = { progress: { status: "pending" } };
+		translations.set(source, cell);
+		void translateLine(cell, source, ctx, config, model, controller.signal, () => requestRender?.());
+	}
+
+	/** 整块门槛按累积文本判定，逐行分发靠缓存去重。 */
+	function dispatch(blockText: string, sources: string[], ctx: ExtensionContext): void {
+		if (sources.length === 0) return;
+		const config = (cachedConfig ??= loadConfig(ctx));
+		if (!config.enabled || !shouldTranslate(blockText, config)) return;
 		const model = resolveTranslatorModel(ctx, config);
 		if (!model) return;
-		liveBlocks.set(key, { lines });
+		for (const source of sources) ensureTranslation(source, ctx, config, model);
+	}
+
+	pi.on("message_update", (event, ctx) => {
+		const blockEvent = event.assistantMessageEvent;
+		// 边流边译：等到 thinking_end 才开译，译文几乎总在该块滚出可重绘区域之后才到，
+		// 终端历史行不可改写，界面就永久停在“等待翻译…”。
+		if (blockEvent.type === "thinking_delta") {
+			if (!blockEvent.delta.includes("\n")) return;
+			// thinking_delta 只带增量，累积文本从 partial 的同一内容块读取。
+			const block = blockEvent.partial.content[blockEvent.contentIndex];
+			if (block?.type !== "thinking") return;
+			dispatch(block.thinking, completedLines(block.thinking), ctx);
+			return;
+		}
+		if (blockEvent.type !== "thinking_end") return;
+		dispatch(blockEvent.content, splitTranslationLines(blockEvent.content), ctx);
 		// 完整文本的组件可能早于结束事件创建，状态入表后立即请求重绘。
 		requestRender?.();
-		for (const line of lines) {
-			void translateLine(line, ctx, config, model, controller.signal, () => requestRender?.());
-		}
 	});
 }
 
-/** 保留原行数组顺序，让较晚完成的译文仍回到自己的位置。 */
-function formatTranslationLine(line: TranslationLine): string {
-	switch (line.progress.status) {
+/** 渲染顺序由可见行顺序决定，晚到的译文仍落在自己的行位。 */
+function formatTranslationCell(cell: TranslationCell): string {
+	switch (cell.progress.status) {
 		case "pending":
 			return "等待翻译…";
 		case "streaming":
-			return line.progress.translation || "翻译中…";
+			return cell.progress.translation || "翻译中…";
 		case "done":
-			return line.progress.translation;
+			return cell.progress.translation;
 		case "error":
-			return `翻译失败：${line.progress.error.replace(/\s+/g, " ").slice(0, 120)}`;
+			return `翻译失败：${cell.progress.error.replace(/\s+/g, " ").slice(0, 120)}`;
 	}
 }
 
 /** 每行独立请求并立即消费增量，避免慢行阻塞同块其他译文。 */
 async function translateLine(
-	line: TranslationLine,
+	cell: TranslationCell,
+	source: string,
 	ctx: ExtensionContext,
 	config: ResolvedTranslatorConfig,
 	translatorModel: Model<Api>,
@@ -141,11 +170,11 @@ async function translateLine(
 	try {
 		const auth = await getTranslatorAuth(ctx, translatorModel);
 		if (signal.aborted) return;
-		const prompt = buildTranslationPrompt(line.source, config.targetLanguage);
+		const prompt = buildTranslationPrompt(source, config.targetLanguage);
 		const eventStream = stream(
 			translatorModel,
 			{ messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(8192, Math.max(1024, Math.ceil(line.source.length * 1.3))), signal },
+			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(8192, Math.max(1024, Math.ceil(source.length * 1.3))), signal },
 		);
 		let translation = "";
 		for await (const event of eventStream) {
@@ -153,30 +182,30 @@ async function translateLine(
 			if (event.type === "error") throw new Error(event.error.errorMessage || `translation ${event.reason}`);
 			if (event.type === "text_delta") {
 				translation += event.delta;
-				line.progress = { status: "streaming", translation };
+				cell.progress = { status: "streaming", translation };
 				requestRender();
 			}
 		}
 		if (signal.aborted) return;
-		line.progress = { status: "done", translation: cleanTranslation(translation) };
+		cell.progress = { status: "done", translation: cleanTranslation(translation) };
 		requestRender();
 	} catch (error) {
 		if (signal.aborted) return;
-		line.progress = { status: "error", error: error instanceof Error ? error.message : String(error) };
+		cell.progress = { status: "error", error: error instanceof Error ? error.message : String(error) };
 		requestRender();
 		notifyTranslationFailure(ctx, error);
 	}
 }
 
-/** 统一换行和块首尾空白，让结束事件与宿主显示文本使用相同身份。 */
-function thinkingTextKey(text: string): string {
-	return text.replace(/\r\n/g, "\n").trim();
+/** 末行可能仍在生成，只取最后一个换行之前已完成的行。 */
+function completedLines(text: string): string[] {
+	const boundary = text.lastIndexOf("\n");
+	return boundary < 0 ? [] : splitTranslationLines(text.slice(0, boundary));
 }
 
-/** 按换行符分行，只请求含拉丁字母的非空行，重复行仍各自保留位置。 */
-function splitTranslationLines(text: string): TranslationLineSource[] {
-	return text.split("\n").map((source) => source.trim()).filter((source) => /[A-Za-z]/.test(source))
-		.map((source, index) => ({ index, source }));
+/** 按换行符分行，只保留含拉丁字母的非空行；重复行由调用方按缓存合并。 */
+function splitTranslationLines(text: string): string[] {
+	return text.split("\n").map((line) => line.trim()).filter((line) => /[A-Za-z]/.test(line));
 }
 
 /** 配置只在显式初始化时写入，避免启动扩展就改动用户文件。 */
@@ -406,9 +435,9 @@ export const __testing = {
 	CONFIG_FILE_NAME,
 	DEFAULT_CONFIG,
 	cleanTranslation,
+	completedLines,
 	getProjectConfigPath,
 	getGlobalConfigPath,
-	thinkingTextKey,
 	mergeConfig,
 	normalizeTranslatorModel,
 	shouldTranslate,

@@ -6,13 +6,12 @@ It renders one translation box directly below each visible assistant thinking bl
 
 ## Features
 
-- Watches `message_update` events and acts only when a thinking block completes (`thinking_end`), using the event's full text.
-- Applies a whole-block gate first: the block must contain at least `minLatinChars` Latin letters, and more Latin letters than Chinese characters.
-- Splits a translatable block on newlines, trims each line, and drops empty lines and lines without Latin letters.
+- Watches `message_update` events and translates while the thinking block is still streaming: every time a delta closes a line, that line is dispatched. Terminal history rows cannot be repainted, so a translation that only starts at `thinking_end` almost always lands after the block has scrolled out of the repaintable region and the box stays frozen on "等待翻译…".
+- Applies a whole-block gate to the accumulated thinking text: it must contain at least `minLatinChars` Latin letters, and more Latin letters than Chinese characters. The gate is re-checked on every dispatch, so a block that qualifies mid-stream starts translating immediately.
+- Splits thinking on newlines, trims each line, and drops empty lines and lines without Latin letters. The still-growing trailing line is withheld until its newline arrives.
 - Sends every remaining line to the configured translator model as its own concurrent streaming request; lines fill in as they arrive and are placed back in original line order.
-- Renders one translation box below the thinking block it belongs to, via `pi.registerAssistantThinkingRenderer`. Block identity is the normalized full text (uniform newlines, trimmed ends), so the box always attaches to the right block.
-- Each box shows a `思考翻译 · 块 N · done/total` title (N counts thinking blocks within the same message) plus per-line status: waiting, streaming partial text, final text, or a failure message. Late translation updates repaint through the host-provided `requestRender`.
-- Uses a model already configured in omp's model registry; credentials come from the host registry, never from extension-side configuration.
+- Renders one translation box below the thinking block it belongs to, via `pi.registerAssistantThinkingRenderer`. Identity is per line, not per block: the renderer splits the thinking text the host actually displays and looks each line up in the in-memory translation table. Lines the host elides from display (fenced code under prose-only thinking, empty reasoning-summary comments) simply have no slot.
+- Each box shows a `思考翻译 · 块 N · done/total` title (N counts thinking blocks within the same message) plus per-line status: waiting, streaming partial text, final text, or a failure message. Late translation updates repaint through the host-provided `requestRender` for as long as those rows are still on screen.
 - Supports a global config with per-project overrides.
 
 ## Requirements
@@ -137,19 +136,20 @@ If any config file fails to parse, the extension shows a one-time warning naming
 
 ## How It Works
 
-1. During an agent turn, the extension listens to `message_update` events and ignores everything except `thinking_end`.
-2. It applies the whole-block gate (`minLatinChars` plus the Latin-over-Chinese majority check) to the event's full text.
-3. It splits the text on newlines, trims each line, and keeps only non-empty lines containing Latin letters.
-4. Unless an identical normalized block is already tracked, it records the block under its normalized-text key and fires one independent streaming request per line; each line consumes its own incremental deltas, so a slow line never blocks its siblings, and every line lands back in original order.
-5. The renderer registered with `pi.registerAssistantThinkingRenderer` looks up the visible thinking text by the same normalized key and draws the translation box beneath that block, with a `done/total` title and per-line status.
-6. Every translation arrival or failure calls the host-provided `requestRender`, so boxes that appear while their thinking block is already on screen still fill in and recount automatically.
-7. Translations live only in an in-memory table keyed by normalized text and are dropped on session start, session switch, and session shutdown. Nothing is appended to the session transcript and no translation is ever fed back as model input.
+1. During an agent turn, the extension listens to `message_update` and reacts to `thinking_delta` (only when the delta contains a newline) and `thinking_end`.
+2. It applies the whole-block gate (`minLatinChars` plus the Latin-over-Chinese majority check) to the thinking text accumulated so far.
+3. It splits that text on newlines, trims each line, and keeps only non-empty lines containing Latin letters; on a delta the trailing partial line is excluded.
+4. Each line text is translated at most once: the first dispatch creates its slot in the translation table and fires one independent streaming request, and every later dispatch of the same text reuses that slot. Slow lines never block their siblings, and every line lands back in original order.
+5. The renderer registered with `pi.registerAssistantThinkingRenderer` splits the visible thinking text into the same lines, looks up each slot, and draws the translation box beneath that block with a `done/total` title and per-line status.
+6. Every translation arrival or failure calls the host-provided `requestRender`, so a box already on screen keeps filling in and recounting.
+7. Translations live only in an in-memory table keyed by line text and are dropped on session start, session switch, and session shutdown. Nothing is appended to the session transcript and no translation is ever fed back as model input.
 
 ## Limitations
 
 - If a thinking block is not visible (for example folded away by the host so it never renders), the host never invokes the translation renderer and no box appears for it.
+- Terminal scrollback is immutable: once a box's rows scroll out of the repaintable region, whatever they showed at that moment is final. Translating while thinking streams is what keeps them from freezing on "等待翻译…", but a line whose request is still in flight when its rows leave the screen stays unfinished there.
 - Translations exist only in memory: quitting omp or switching sessions discards them, and previously shown messages are not backfilled when a session reopens.
-- Within one session, two blocks with identical normalized text share a single stored translation.
+- Within one session, two lines with identical text share a single translation.
 
 ## Security Notes
 
