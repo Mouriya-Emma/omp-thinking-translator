@@ -17,16 +17,16 @@ This package is a Pi extension for users who prefer to inspect visible assistant
 
 ## Install
 
-Install from npm:
+This package is not published to npm. Install it from Git:
 
 ```bash
-pi install npm:pi-thinking-translator
+pi install git:github.com/mouriya-s-lab/pi-thinking-translator
 ```
 
-Install from GitHub:
+Pin a tag or commit when you want a fixed version:
 
 ```bash
-pi install git:github.com/mouriya-s-lab/pi-thinking-translator@v0.2.0
+pi install git:github.com/mouriya-s-lab/pi-thinking-translator@<tag-or-commit>
 ```
 
 For local development from a checkout:
@@ -42,7 +42,7 @@ Requires a Pi build that provides `registerEntryRenderer` (verified with 0.85.1)
 1. Install the extension:
 
    ```bash
-   pi install npm:pi-thinking-translator
+   pi install git:github.com/mouriya-s-lab/pi-thinking-translator
    ```
 
 2. Create a global config template from inside Pi:
@@ -179,7 +179,7 @@ Pi extension development notes for this repository live in [`docs/`](./docs/READ
 - [`docs/pi-extension-events.md`](./docs/pi-extension-events.md) — event timing plus session, LLM context, and compaction boundaries.
 - [`docs/extension-development-guide.md`](./docs/extension-development-guide.md) — end-to-end development flow with a runnable example under [`docs/examples/`](./docs/examples).
 
-All three are written against the locally installed Pi runtime and cite `path:line` evidence. They are excluded from the npm tarball by the `files` whitelist.
+All three are written against the locally installed Pi runtime and cite `path:line` evidence.
 
 ## Development
 
