@@ -9,10 +9,11 @@ test("config paths honor the active omp agent directory and project root", () =>
 	assert.equal(__testing.getProjectConfigPath(undefined), undefined);
 });
 
-test("completedLines withholds the still-growing trailing line", () => {
-	assert.deepEqual(__testing.completedLines("first\nsecond\nthi"), ["first", "second"]);
-	assert.deepEqual(__testing.completedLines("first\nsecond\n"), ["first", "second"]);
-	assert.deepEqual(__testing.completedLines("only one partial line"), []);
+test("a short single-line thinking block is translatable", () => {
+	// 复现用户报告：短 thinking 紧接工具调用时整块长度门槛把它整块跳过了。
+	const line = "Let me check the session_init entry in the child, it might contain agent info.";
+	assert.equal(__testing.shouldTranslateLine(line), true);
+	assert.deepEqual(__testing.splitTranslationLines(line), [line]);
 });
 
 test("legacy and unknown fields are ignored without losing valid overrides", () => {
@@ -27,16 +28,15 @@ test("legacy and unknown fields are ignored without losing valid overrides", () 
 });
 
 test("invalid known fields fail closed instead of enabling unexpected requests", () => {
-	for (const value of [null, [], { enabled: "yes" }, { minLatinChars: -1 }, { targetLanguage: "" }]) {
+	for (const value of [null, [], { enabled: "yes" }, { targetLanguage: "" }]) {
 		assert.throws(() => __testing.mergeConfig(__testing.DEFAULT_CONFIG, value));
 	}
 });
 
-test("mergeConfig layers targetLanguage and minLatinChars overrides", () => {
-	const base = { ...__testing.DEFAULT_CONFIG };
-	const layered = __testing.mergeConfig(base, { targetLanguage: "English", minLatinChars: 5 });
+test("the removed minLatinChars key is ignored instead of gating translation", () => {
+	const layered = __testing.mergeConfig(__testing.DEFAULT_CONFIG, { targetLanguage: "English", minLatinChars: 250 });
 	assert.equal(layered.targetLanguage, "English");
-	assert.equal(layered.minLatinChars, 5);
+	assert.equal("minLatinChars" in layered, false);
 });
 
 test("mergeConfig supports partial translatorModel overlay and null clears", () => {
@@ -85,18 +85,37 @@ test("normalizeTranslatorModel rejects incomplete or non-object models", () => {
 	});
 });
 
-test("shouldTranslate passes at threshold and fails below", () => {
-	const config = { ...__testing.DEFAULT_CONFIG, minLatinChars: 10 };
-	assert.equal(__testing.shouldTranslate("a".repeat(10), config), true);
-	assert.equal(__testing.shouldTranslate("a".repeat(9), config), false);
-	assert.equal(__testing.shouldTranslate("", config), false);
+test("shouldTranslateLine accepts foreign lines of any length and rejects the rest", () => {
+	assert.equal(__testing.shouldTranslateLine("OK."), true);
+	assert.equal(__testing.shouldTranslateLine("abcde你好"), true);
+	assert.equal(__testing.shouldTranslateLine("abcde你好啊你好"), false);
+	assert.equal(__testing.shouldTranslateLine("已经确认过了。"), false);
+	assert.equal(__testing.shouldTranslateLine("123 —— 456"), false);
+	assert.equal(__testing.shouldTranslateLine(""), false);
 });
 
-test("shouldTranslate requires Latin dominance over CJK", () => {
-	const config = { ...__testing.DEFAULT_CONFIG, minLatinChars: 5 };
-	assert.equal(__testing.shouldTranslate("abcde你好", config), true);
-	assert.equal(__testing.shouldTranslate("abcde你好啊你好", config), false);
-	assert.equal(__testing.shouldTranslate("abcde你好啊你好啊", config), false);
+test("isCompleteBlockLine accepts host rewrites and rejects reveal prefixes", () => {
+	const raw = "Check the parser first.\n```ts\nconst x = 1;\n```\nThen run the tests.";
+	assert.equal(__testing.isCompleteBlockLine(raw, "Check the parser first."), true);
+	assert.equal(__testing.isCompleteBlockLine(raw, "Then run the tests."), true);
+	// 宿主折叠代码围栏时会把前一行改成省略号收尾，有时还吃掉句末句号。
+	assert.equal(__testing.isCompleteBlockLine(raw, "Check the parser first...."), true);
+	assert.equal(__testing.isCompleteBlockLine(raw, "Check the parser first…"), true);
+	// 流式揭示的前缀每次重绘都是新键，必须挡住，否则一行会被翻译成好几份。
+	assert.equal(__testing.isCompleteBlockLine(raw, "Check the par"), false);
+	assert.equal(__testing.isCompleteBlockLine(raw, "Then run the te"), false);
+	// 历史消息的行不属于当前块，不会被重新分发。
+	assert.equal(__testing.isCompleteBlockLine(raw, "A line from an older message."), false);
+	// 块尾没有换行时末行仍然算完整。
+	assert.equal(__testing.isCompleteBlockLine("Only one line here.", "Only one line here."), true);
+});
+
+test("cellKey separates translator model and target language", () => {
+	const base = { ...__testing.DEFAULT_CONFIG, translatorModel: { provider: "ollama", id: "qwen2.5:7b" } };
+	const line = "Check the parser first.";
+	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey({ ...base, targetLanguage: "Japanese" }, line));
+	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey({ ...base, translatorModel: { provider: "ollama", id: "other" } }, line));
+	assert.equal(__testing.cellKey(base, line), __testing.cellKey({ ...base }, line));
 });
 
 test("cleanTranslation removes common model wrappers", () => {

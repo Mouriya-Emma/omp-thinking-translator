@@ -15,15 +15,17 @@
 
 ## 2. 确认不进入对话流
 
-- [ ] 验证追加译文是否会进入后续 LLM 上下文。
-- [x] 如果会进入上下文，通过 `context` 与 `session_before_compact` 边界过滤展示译文。
-- [ ] 验证 compaction 时不会把译文当作模型原始 thinking 参与摘要。
-- [ ] 在 README 里说明对会话上下文和思考内容的影响边界。
+- [x] 验证追加译文是否会进入后续 LLM 上下文：不会。omp 18.1.19 上用只读观察扩展挂 `before_provider_request`（发送前最后一道钩子），译文片段与译文框标签在完整 payload 里出现 0 次，assistant `thinking` 保持原文哈希。
+- [x] 现架构下译文从不写入 canonical message，因此不需要 `context` / `session_before_compact` 过滤；扩展也不注册这五个能改模型可见数据的钩子（`context`、`before_provider_request`、`before_agent_start`、`session_before_compact`、`session_stop`）。旧的过滤实现属于译文作为消息追加的时代（14a4343），迁移到渲染器后已随之删除。
+- [x] 验证 compaction 不会把译文当作原始 thinking 参与摘要：`session_before_compact` 观察到 `messagesToSummarize` = 13 且含该 assistant 消息（thinking 哈希未变），preparation、落盘的 3958 字摘要、compaction 后的 provider payload 中译文与标签均为 0 次。
+- [x] README 新增 [Context Boundary](README.md#context-boundary)：机制、runtime 证据、最小复现步骤，以及不覆盖的范围（翻译请求本身、终端/`debug-transcript` 等展示衍生产物、export/resume 未测、版本限定）。
 
 验收标准：
 - 翻译展示不改变原始 thinking/reasoning block。
 - 翻译展示不会影响后续模型思考内容。
 - 可通过最小复现步骤确认上下文无污染。
+
+以上三条已在 omp 18.1.19 真实 TUI 会话中验证；证据与复现步骤见 README 的 Context Boundary 一节。
 
 ## 3. 添加 API 翻译支持
 

@@ -11,12 +11,15 @@ type TranslationProgress =
 	| { status: "pending" }
 	| { status: "streaming" | "done"; translation: string }
 	| { status: "error"; error: string };
-/** 一行一个共享状态格；文本相同的行共用同一次请求。 */
-type TranslationCell = { progress: TranslationProgress };
+/**
+ * 一行一个共享状态格；文本相同的行共用同一次请求。
+ * `painted` 记录译文落地后那几行有没有再被渲染过：宿主把 thinking 行提交进原生历史后就不再调用
+ * 组件的 render，这一位因此能区分"已经画上去了"和"永远画不上去了"。
+ */
+type TranslationCell = { progress: TranslationProgress; painted: boolean };
 type ResolvedTranslatorConfig = {
 	enabled: boolean;
 	targetLanguage: string;
-	minLatinChars: number;
 	translatorModel?: ModelRef;
 };
 type NotifyLevel = "info" | "warning" | "error";
@@ -32,22 +35,36 @@ const CONFIG_FILE_NAME = "thinking-translator.json";
 const DEFAULT_CONFIG: ResolvedTranslatorConfig = {
 	enabled: true,
 	targetLanguage: "Simplified Chinese",
-	minLatinChars: 250,
 };
+/** 兜底 widget 的 key、保留条数，以及判定"已经画不上去"前给重绘留的宽限。 */
+const LATE_WIDGET_KEY = "thinking-translator-late";
+const LATE_WIDGET_ENTRIES = 3;
+const LATE_PAINT_GRACE_MS = 700;
 const configErrorNotified = new Set<string>();
 const translationFailureNotified = new Set<string>();
 let missingModelWarningKey: string | undefined;
 
 /** 译文只附着在可见 thinking 下方，不写入会话或模型上下文。 */
 export default function thinkingTranslator(pi: ExtensionAPI) {
-	// 以行文本为身份：宿主展示的 thinking 会折叠代码围栏与注释噪声，整块文本做键会错配。
+	// 身份取宿主真正展示出来的那一行：宿主会折叠代码围栏、丢掉空注释、流式时只揭示前缀，
+	// 拿 thinking 事件里的原始文本当键，总有展示行查不到自己的译文格。
 	const translations = new Map<string, TranslationCell>();
 	let cachedConfig: ResolvedTranslatorConfig | undefined;
+	// 渲染器工厂拿不到 ExtensionContext，模型注册表与通知只能借最近一次事件的上下文。
+	let latestContext: ExtensionContext | undefined;
 	let requestRender: (() => void) | undefined;
 	let controller = new AbortController();
+	// 本条消息里每个 thinking 块的原始文本，用来判断展示行属于当前消息而非历史回放。
+	const liveBlocks = new Map<number, string>();
+	const endedBlocks = new Set<number>();
+	let messageInFlight = false;
+
+	// 迟到译文的兜底展示：内容与已排期的宽限计时器。
+	const lateTranslations: string[] = [];
+	const lateTimers = new Set<NodeJS.Timeout>();
 
 	pi.registerAssistantThinkingRenderer((context, theme) => {
-		// thinking 文本每次变化都会重建组件，工厂期的拆分就是当前可见行。
+		// 展示文本每次变化都会重建组件，工厂期的拆分就是当前可见行。
 		const sources = splitTranslationLines(context.text);
 		requestRender = context.requestRender;
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
@@ -57,15 +74,20 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		box.addChild(body);
 		return {
 			render(width: number): readonly string[] {
+				dispatch(context.contentIndex, sources);
+				const config = cachedConfig;
+				if (!config) return [];
 				const cells: TranslationCell[] = [];
 				for (const source of sources) {
-					const cell = translations.get(source);
+					const cell = translations.get(cellKey(config, source));
 					if (cell) cells.push(cell);
 				}
 				if (cells.length === 0) return [];
 				let completed = 0;
 				for (const cell of cells) {
 					if (cell.progress.status === "done" || cell.progress.status === "error") completed++;
+					// 只要这一格已经有正文画出去，框里就看得见译文；真正需要兜底的是一个字都没画上的格。
+					if (cell.progress.status === "done" || (cell.progress.status === "streaming" && cell.progress.translation.length > 0)) cell.painted = true;
 				}
 				title.setText(theme.fg("accent", `思考翻译 · 块 ${context.thinkingIndex + 1} · ${completed}/${cells.length}`));
 				body.setText(cells.map(formatTranslationCell).join("\n\n"));
@@ -91,7 +113,15 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		controller.abort();
 		controller = new AbortController();
 		translations.clear();
+		lateTranslations.length = 0;
+		for (const timer of lateTimers) clearTimeout(timer);
+		lateTimers.clear();
+		latestContext?.ui?.setWidget?.(LATE_WIDGET_KEY, undefined);
+		liveBlocks.clear();
+		endedBlocks.clear();
+		messageInFlight = false;
 		cachedConfig = undefined;
+		latestContext = undefined;
 		configErrorNotified.clear();
 		requestRender = undefined;
 		translationFailureNotified.clear();
@@ -101,44 +131,85 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	pi.on("session_switch", resetTranslations);
 	pi.on("session_shutdown", resetTranslations);
 
-	// thinking 增量事件太密，配置每条消息只读一次盘。
-	pi.on("message_start", () => {
-		cachedConfig = undefined;
-	});
-
-	/** 同一行文本只请求一次；建格后立即发起请求。 */
-	function ensureTranslation(source: string, ctx: ExtensionContext, config: ResolvedTranslatorConfig, model: Model<Api>): void {
-		if (translations.has(source)) return;
-		const cell: TranslationCell = { progress: { status: "pending" } };
-		translations.set(source, cell);
-		void translateLine(cell, source, ctx, config, model, controller.signal, () => requestRender?.());
-	}
-
-	/** 整块门槛按累积文本判定，逐行分发靠缓存去重。 */
-	function dispatch(blockText: string, sources: string[], ctx: ExtensionContext): void {
-		if (sources.length === 0) return;
+	/**
+	 * 分发点在渲染期：只有这里知道宿主最终展示了哪些行。
+	 * 生成中的末行每次重绘都会变成新键，等本块收尾再译；历史块的行不属于当前消息，不重译。
+	 */
+	function dispatch(contentIndex: number, sources: readonly string[]): void {
+		const ctx = latestContext;
+		const raw = liveBlocks.get(contentIndex);
+		if (!ctx || raw === undefined || sources.length === 0) return;
+		const settled = !messageInFlight || endedBlocks.has(contentIndex);
+		const candidates = settled ? sources : sources.slice(0, -1);
 		const config = (cachedConfig ??= loadConfig(ctx));
-		if (!config.enabled || !shouldTranslate(blockText, config)) return;
+		if (!config.enabled) return;
+		const missing = candidates.filter((line) => shouldTranslateLine(line) && isCompleteBlockLine(raw, line) && !translations.has(cellKey(config, line)));
+		if (missing.length === 0) return;
 		const model = resolveTranslatorModel(ctx, config);
 		if (!model) return;
-		for (const source of sources) ensureTranslation(source, ctx, config, model);
+		for (const line of missing) {
+			const key = cellKey(config, line);
+			// 同一次分发里的重复行共用一格。
+			if (translations.has(key)) continue;
+			const cell: TranslationCell = { progress: { status: "pending" }, painted: false };
+			translations.set(key, cell);
+			void translateLine(cell, line, ctx, config, model, controller.signal, () => requestRender?.()).then(() => watchForLateTranslation(cell, ctx));
+		}
 	}
 
+	/**
+	 * 译文晚于宿主提交那几行的时刻落地时，组件已经从可重绘集合里移出，框里永远停在"等待翻译…"。
+	 * 宽限期后仍未被渲染的译文改写到编辑器上方的常驻 widget，那块 UI 一直可重绘。
+	 */
+	function watchForLateTranslation(cell: TranslationCell, ctx: ExtensionContext): void {
+		if (cell.progress.status !== "done" || cell.painted) return;
+		const translation = cell.progress.translation;
+		if (!translation) return;
+		const timer = setTimeout(() => {
+			lateTimers.delete(timer);
+			if (cell.painted) return;
+			if (lateTranslations.includes(translation)) return;
+			lateTranslations.push(translation);
+			if (lateTranslations.length > LATE_WIDGET_ENTRIES) lateTranslations.shift();
+			ctx.ui?.setWidget?.(
+				LATE_WIDGET_KEY,
+				["思考翻译 · 已滚出可重绘区域", ...lateTranslations.map((text) => `· ${text.replace(/\s+/g, " ").slice(0, 300)}`)],
+				{ placement: "aboveEditor" },
+			);
+		}, LATE_PAINT_GRACE_MS);
+		timer.unref?.();
+		lateTimers.add(timer);
+	}
+
+	pi.on("message_start", (_event, ctx) => {
+		latestContext = ctx;
+		// thinking 增量事件太密，配置每条消息只读一次盘。
+		cachedConfig = undefined;
+		liveBlocks.clear();
+		endedBlocks.clear();
+		messageInFlight = true;
+	});
+
 	pi.on("message_update", (event, ctx) => {
+		latestContext = ctx;
 		const blockEvent = event.assistantMessageEvent;
-		// 边流边译：等到 thinking_end 才开译，译文几乎总在该块滚出可重绘区域之后才到，
-		// 终端历史行不可改写，界面就永久停在“等待翻译…”。
 		if (blockEvent.type === "thinking_delta") {
-			if (!blockEvent.delta.includes("\n")) return;
 			// thinking_delta 只带增量，累积文本从 partial 的同一内容块读取。
 			const block = blockEvent.partial.content[blockEvent.contentIndex];
-			if (block?.type !== "thinking") return;
-			dispatch(block.thinking, completedLines(block.thinking), ctx);
+			if (block?.type === "thinking") liveBlocks.set(blockEvent.contentIndex, block.thinking);
 			return;
 		}
 		if (blockEvent.type !== "thinking_end") return;
-		dispatch(blockEvent.content, splitTranslationLines(blockEvent.content), ctx);
-		// 完整文本的组件可能早于结束事件创建，状态入表后立即请求重绘。
+		liveBlocks.set(blockEvent.contentIndex, blockEvent.content);
+		endedBlocks.add(blockEvent.contentIndex);
+		// 末行此刻才定型，催一次重绘让它进入分发。
+		requestRender?.();
+	});
+
+	// 中断或 provider 漏发 thinking_end 时，这里是末行唯一的收尾机会。
+	pi.on("message_end", (_event, ctx) => {
+		latestContext = ctx;
+		messageInFlight = false;
 		requestRender?.();
 	});
 }
@@ -197,15 +268,33 @@ async function translateLine(
 	}
 }
 
-/** 末行可能仍在生成，只取最后一个换行之前已完成的行。 */
-function completedLines(text: string): string[] {
-	const boundary = text.lastIndexOf("\n");
-	return boundary < 0 ? [] : splitTranslationLines(text.slice(0, boundary));
+/** 键里带上模型与目标语言，改配置后不会复用上一轮的译文。 */
+function cellKey(config: ResolvedTranslatorConfig, line: string): string {
+	const model = config.translatorModel;
+	return `${model ? `${model.provider}/${model.id}` : "-"}\u0000${config.targetLanguage}\u0000${line}`;
 }
 
 /** 按换行符分行，只保留含拉丁字母的非空行；重复行由调用方按缓存合并。 */
 function splitTranslationLines(text: string): string[] {
 	return text.split("\n").map((line) => line.trim()).filter((line) => /[A-Za-z]/.test(line));
+}
+
+/**
+ * 展示行必须是这一块原始 thinking 里的一整行。
+ * 流式揭示会把行截成前缀（`thinking_end` 之后仍在继续揭示），这种前缀每次重绘都是新键，必须挡住；
+ * 宿主折叠代码围栏时又会把前一行改写成省略号收尾、甚至吃掉句末句号，这两种改写要能对上。
+ * 历史消息的展示行对不上当前块的原文，因此也不会被重复翻译。
+ */
+function isCompleteBlockLine(raw: string, line: string): boolean {
+	const normalized = line.replace(/(?:\.{3}|…)$/, "").trimEnd();
+	if (!normalized) return false;
+	for (let from = 0; ; from = from + 1) {
+		const index = raw.indexOf(normalized, from);
+		if (index < 0) return false;
+		// 行尾允许残留被改写吃掉的句末标点和行内空白，但后面必须就是换行或块尾。
+		if (/^[.。…]*[^\S\n]*(?:\n|$)/.test(raw.slice(index + normalized.length))) return true;
+		from = index;
+	}
 }
 
 /** 配置只在显式初始化时写入，避免启动扩展就改动用户文件。 */
@@ -273,11 +362,9 @@ function mergeConfig(base: ResolvedTranslatorConfig, value: unknown): ResolvedTr
 	const raw = value as Record<string, unknown>;
 	if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") throw new Error("enabled must be boolean");
 	if (raw.targetLanguage !== undefined && (typeof raw.targetLanguage !== "string" || !raw.targetLanguage.trim())) throw new Error("targetLanguage must be a non-empty string");
-	if (raw.minLatinChars !== undefined && (typeof raw.minLatinChars !== "number" || !Number.isFinite(raw.minLatinChars) || raw.minLatinChars < 0)) throw new Error("minLatinChars must be a non-negative number");
 	return {
 		enabled: typeof raw.enabled === "boolean" ? raw.enabled : base.enabled,
 		targetLanguage: typeof raw.targetLanguage === "string" ? raw.targetLanguage : base.targetLanguage,
-		minLatinChars: typeof raw.minLatinChars === "number" ? raw.minLatinChars : base.minLatinChars,
 		translatorModel: normalizeTranslatorModel(raw.translatorModel, base.translatorModel),
 	};
 }
@@ -340,7 +427,6 @@ function showConfigStatus(ctx: ExtensionContext): void {
 		"thinking-translator status",
 		`enabled: ${state.config.enabled}`,
 		`targetLanguage: ${state.config.targetLanguage}`,
-		`minLatinChars: ${state.config.minLatinChars}`,
 		`translatorModel: ${modelRef ? `${modelRef.provider}/${modelRef.id}` : "not configured"}`,
 		`model: ${modelStatus}`,
 		...state.paths.map((info) => `${info.scope} config: ${info.path} (${info.exists ? "found" : "not found"})`),
@@ -399,11 +485,12 @@ function buildTranslationPrompt(sourceText: string, targetLanguage: string): str
 	].join("\n");
 }
 
-/** 只翻译拉丁字母达到门槛且多于汉字的整块内容。 */
-function shouldTranslate(text: string, config: ResolvedTranslatorConfig): boolean {
-	const latin = (text.match(/[A-Za-z]/g) ?? []).length;
-	const cjk = (text.match(/[\u4e00-\u9fff]/g) ?? []).length;
-	return latin >= config.minLatinChars && latin > cjk;
+/** 逐行判定：宿主展示的这一行是否是要翻译的外语行，短句同样算。 */
+function shouldTranslateLine(line: string): boolean {
+	const latin = (line.match(/[A-Za-z]/g) ?? []).length;
+	if (latin === 0) return false;
+	const cjk = (line.match(/[\u4e00-\u9fff]/g) ?? []).length;
+	return latin > cjk;
 }
 
 /** 鉴权统一走宿主注册表，失败时提供清晰诊断而不另找凭据。 */
@@ -434,12 +521,13 @@ export const __testing = {
 	// 只暴露配置与纯逻辑入口，避免单测耦合宿主事件调度。
 	CONFIG_FILE_NAME,
 	DEFAULT_CONFIG,
+	cellKey,
 	cleanTranslation,
-	completedLines,
+	isCompleteBlockLine,
 	getProjectConfigPath,
 	getGlobalConfigPath,
 	mergeConfig,
 	normalizeTranslatorModel,
-	shouldTranslate,
+	shouldTranslateLine,
 	splitTranslationLines,
 } as const;
