@@ -36,10 +36,10 @@ const DEFAULT_CONFIG: ResolvedTranslatorConfig = {
 	enabled: true,
 	targetLanguage: "Simplified Chinese",
 };
-/** 兜底 widget 的 key、保留条数，以及判定"已经画不上去"前给重绘留的宽限。 */
+/** 兜底 widget 的 key、保留条数，以及合并重绘与译文抖动的去抖窗口。 */
 const LATE_WIDGET_KEY = "thinking-translator-late";
 const LATE_WIDGET_ENTRIES = 3;
-const LATE_PAINT_GRACE_MS = 700;
+const LATE_WIDGET_DEBOUNCE_MS = 400;
 const configErrorNotified = new Set<string>();
 const translationFailureNotified = new Set<string>();
 let missingModelWarningKey: string | undefined;
@@ -49,7 +49,8 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	// 身份取宿主真正展示出来的那一行：宿主会折叠代码围栏、丢掉空注释、流式时只揭示前缀，
 	// 拿 thinking 事件里的原始文本当键，总有展示行查不到自己的译文格。
 	const translations = new Map<string, TranslationCell>();
-	let cachedConfig: ResolvedTranslatorConfig | undefined;
+	// 只替换、不清空：清空会让历史块的 render 查不到键而整框消失，而键里就含模型与目标语言。
+	let activeConfig: ResolvedTranslatorConfig | undefined;
 	// 渲染器工厂拿不到 ExtensionContext，模型注册表与通知只能借最近一次事件的上下文。
 	let latestContext: ExtensionContext | undefined;
 	let requestRender: (() => void) | undefined;
@@ -59,9 +60,15 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	const endedBlocks = new Set<number>();
 	let messageInFlight = false;
 
-	// 迟到译文的兜底展示：内容与已排期的宽限计时器。
-	const lateTranslations: string[] = [];
-	const lateTimers = new Set<NodeJS.Timeout>();
+	/**
+	 * 兜底 widget 的内容是派生状态：当前 thinking 块里"已完成但一个字都没画出去"的译文。
+	 * 条目持有 cell，所以晚一步的重绘把译文画进框里时，刷新会自动把它从 widget 撤掉——
+	 * 判定不再是靠定时器一次性猜死，而是两侧都能收敛。
+	 */
+	const lateEntries: { block: string; text: string; cell: TranslationCell }[] = [];
+	let lateRefreshTimer: NodeJS.Timeout | undefined;
+	// 块标识 = 消息序号 + contentIndex：下一个块的译文完成时，上一个块的残留就该让位。
+	let messageSeq = 0;
 
 	pi.registerAssistantThinkingRenderer((context, theme) => {
 		// 展示文本每次变化都会重建组件，工厂期的拆分就是当前可见行。
@@ -74,8 +81,8 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		box.addChild(body);
 		return {
 			render(width: number): readonly string[] {
-				dispatch(context.contentIndex, sources);
-				const config = cachedConfig;
+				dispatch(context.contentIndex, sources, context.requestRender);
+				const config = activeConfig;
 				if (!config) return [];
 				const cells: TranslationCell[] = [];
 				for (const source of sources) {
@@ -84,11 +91,17 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 				}
 				if (cells.length === 0) return [];
 				let completed = 0;
+				let painted = false;
 				for (const cell of cells) {
 					if (cell.progress.status === "done" || cell.progress.status === "error") completed++;
 					// 只要这一格已经有正文画出去，框里就看得见译文；真正需要兜底的是一个字都没画上的格。
-					if (cell.progress.status === "done" || (cell.progress.status === "streaming" && cell.progress.translation.length > 0)) cell.painted = true;
+					if (cell.progress.status === "done" || (cell.progress.status === "streaming" && cell.progress.translation.length > 0)) {
+						if (!cell.painted) painted = true;
+						cell.painted = true;
+					}
 				}
+				// 这一帧刚画上的译文可能正挂在 widget 里等着被撤掉。
+				if (painted) scheduleLateRefresh();
 				title.setText(theme.fg("accent", `思考翻译 · 块 ${context.thinkingIndex + 1} · ${completed}/${cells.length}`));
 				body.setText(cells.map(formatTranslationCell).join("\n\n"));
 				return box.render(width);
@@ -108,19 +121,51 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		handler: handleConfigCommand,
 	});
 
+	/**
+	 * widget 内容重算一次：撤掉已经画进框里的条目，空了就把 widget 摘掉。
+	 * 去抖是为了合并"译文完成"和"随后那一帧重绘"，避免在框马上就能画出来时闪一下。
+	 */
+	function scheduleLateRefresh(): void {
+		if (lateRefreshTimer !== undefined) return;
+		lateRefreshTimer = setTimeout(() => {
+			lateRefreshTimer = undefined;
+			const ctx = latestContext;
+			if (!ctx?.ui?.setWidget) return;
+			for (let index = lateEntries.length - 1; index >= 0; index--) {
+				if (lateEntries[index]!.cell.painted) lateEntries.splice(index, 1);
+			}
+			if (lateEntries.length === 0) {
+				ctx.ui.setWidget(LATE_WIDGET_KEY, undefined);
+				return;
+			}
+			ctx.ui.setWidget(
+				LATE_WIDGET_KEY,
+				// widget 的行是纯文本组件，译文里的 Markdown 强调标记只会原样露出来，这里去掉。
+				["思考翻译 · 已滚出可重绘区域", ...lateEntries.map((entry) => `· ${entry.text.replace(/\*\*|__/g, "").replace(/\s+/g, " ").slice(0, 300)}`)],
+				{ placement: "aboveEditor" },
+			);
+		}, LATE_WIDGET_DEBOUNCE_MS);
+		lateRefreshTimer.unref?.();
+	}
+
+	/** 会话级重置：连同未到期的刷新一起丢掉。 */
+	function clearLateWidget(): void {
+		lateEntries.length = 0;
+		clearTimeout(lateRefreshTimer);
+		lateRefreshTimer = undefined;
+		latestContext?.ui?.setWidget?.(LATE_WIDGET_KEY, undefined);
+	}
+
 	/** 切换会话时中止旧请求并丢弃译文缓存。 */
 	function resetTranslations(): void {
 		controller.abort();
 		controller = new AbortController();
 		translations.clear();
-		lateTranslations.length = 0;
-		for (const timer of lateTimers) clearTimeout(timer);
-		lateTimers.clear();
-		latestContext?.ui?.setWidget?.(LATE_WIDGET_KEY, undefined);
+		clearLateWidget();
 		liveBlocks.clear();
 		endedBlocks.clear();
 		messageInFlight = false;
-		cachedConfig = undefined;
+		activeConfig = undefined;
 		latestContext = undefined;
 		configErrorNotified.clear();
 		requestRender = undefined;
@@ -134,14 +179,16 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	/**
 	 * 分发点在渲染期：只有这里知道宿主最终展示了哪些行。
 	 * 生成中的末行每次重绘都会变成新键，等本块收尾再译；历史块的行不属于当前消息，不重译。
+	 * 重绘回调取自发起分发的那个组件，而不是模块里"最后一次"的那个：后者会被下一块的工厂覆盖，
+	 * 译文回来时催的就不是自己那一块。
 	 */
-	function dispatch(contentIndex: number, sources: readonly string[]): void {
+	function dispatch(contentIndex: number, sources: readonly string[], notify: () => void): void {
 		const ctx = latestContext;
 		const raw = liveBlocks.get(contentIndex);
 		if (!ctx || raw === undefined || sources.length === 0) return;
 		const settled = !messageInFlight || endedBlocks.has(contentIndex);
 		const candidates = settled ? sources : sources.slice(0, -1);
-		const config = (cachedConfig ??= loadConfig(ctx));
+		const config = (activeConfig ??= loadConfig(ctx));
 		if (!config.enabled) return;
 		const missing = candidates.filter((line) => shouldTranslateLine(line) && isCompleteBlockLine(raw, line) && !translations.has(cellKey(config, line)));
 		if (missing.length === 0) return;
@@ -153,42 +200,39 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			if (translations.has(key)) continue;
 			const cell: TranslationCell = { progress: { status: "pending" }, painted: false };
 			translations.set(key, cell);
-			void translateLine(cell, line, ctx, config, model, controller.signal, () => requestRender?.()).then(() => watchForLateTranslation(cell, ctx));
+			const block = `${messageSeq}:${contentIndex}`;
+			void translateLine(cell, line, ctx, config, model, controller.signal, notify).then(() => noteTranslationSettled(cell, block));
 		}
 	}
 
 	/**
-	 * 译文晚于宿主提交那几行的时刻落地时，组件已经从可重绘集合里移出，框里永远停在"等待翻译…"。
-	 * 宽限期后仍未被渲染的译文改写到编辑器上方的常驻 widget，那块 UI 一直可重绘。
+	 * 译文完成时才知道它有没有赶上重绘：宿主把 thinking 行提交进原生历史后组件不再被渲染，
+	 * 那一格永远画不上去，只能改到常驻 widget。这里只登记，真正的取舍交给 scheduleLateRefresh，
+	 * 所以晚一步到达的重绘仍能把条目撤掉。
+	 * 同时，下一个 thinking 块的译文一完成，上一个块的残留就出局。
 	 */
-	function watchForLateTranslation(cell: TranslationCell, ctx: ExtensionContext): void {
-		if (cell.progress.status !== "done" || cell.painted) return;
-		const translation = cell.progress.translation;
-		if (!translation) return;
-		const timer = setTimeout(() => {
-			lateTimers.delete(timer);
-			if (cell.painted) return;
-			if (lateTranslations.includes(translation)) return;
-			lateTranslations.push(translation);
-			if (lateTranslations.length > LATE_WIDGET_ENTRIES) lateTranslations.shift();
-			ctx.ui?.setWidget?.(
-				LATE_WIDGET_KEY,
-				// widget 的行是纯文本组件，译文里的 Markdown 强调标记只会原样露出来，这里去掉。
-				["思考翻译 · 已滚出可重绘区域", ...lateTranslations.map((text) => `· ${text.replace(/\*\*|__/g, "").replace(/\s+/g, " ").slice(0, 300)}`)],
-				{ placement: "aboveEditor" },
-			);
-		}, LATE_PAINT_GRACE_MS);
-		timer.unref?.();
-		lateTimers.add(timer);
+	function noteTranslationSettled(cell: TranslationCell, block: string): void {
+		if (cell.progress.status !== "done" || !cell.progress.translation) return;
+		const text = cell.progress.translation;
+		for (let index = lateEntries.length - 1; index >= 0; index--) {
+			const entry = lateEntries[index]!;
+			if (entry.block !== block || entry.text === text) lateEntries.splice(index, 1);
+		}
+		if (!cell.painted) {
+			lateEntries.push({ block, text, cell });
+			if (lateEntries.length > LATE_WIDGET_ENTRIES) lateEntries.shift();
+		}
+		scheduleLateRefresh();
 	}
 
 	pi.on("message_start", (_event, ctx) => {
 		latestContext = ctx;
-		// thinking 增量事件太密，配置每条消息只读一次盘。
-		cachedConfig = undefined;
+		// thinking 增量事件太密，配置每条消息只读一次盘；这里直接换成新值，render 永远有键可用。
+		activeConfig = loadConfig(ctx);
 		liveBlocks.clear();
 		endedBlocks.clear();
 		messageInFlight = true;
+		messageSeq++;
 	});
 
 	pi.on("message_update", (event, ctx) => {
