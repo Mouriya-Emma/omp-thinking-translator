@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { __testing } from "../extensions/thinking-translator.ts";
+import { formatThinkingForDisplay } from "../node_modules/@oh-my-pi/pi-coding-agent/src/utils/thinking-display.ts";
 
 test("config paths honor the active omp agent directory and project root", () => {
 	assert.equal(__testing.getGlobalConfigPath("/profiles/work/agent", "/home/user"), "/profiles/work/agent/thinking-translator.json");
@@ -108,6 +109,27 @@ test("isCompleteBlockLine accepts host rewrites and rejects reveal prefixes", ()
 	assert.equal(__testing.isCompleteBlockLine(raw, "A line from an older message."), false);
 	// 块尾没有换行时末行仍然算完整。
 	assert.equal(__testing.isCompleteBlockLine("Only one line here.", "Only one line here."), true);
+});
+
+/**
+ * 宿主真的会改写展示文本：prose-only 模式下折叠代码围栏、补省略号、吃掉句末句号、丢掉空注释。
+ * 这些改写过的行必须仍能认回原文，否则它们在译文框里永远没有自己的格。
+ */
+test("every line the host still displays matches its raw thinking", () => {
+	const samples = [
+		"Let me check the config file first.\n```json\n{\"a\": 1}\n```\nThen I will run the tests.",
+		"The helper currently looks like this:\n```ts\nfunction parse(input: string) {\n  return input.trim();\n}\n```\nSo trailing whitespace is dropped.",
+		"I will sketch the helper now.\n```ts\nfunction f() {",
+		"First I confirm the path.\n<!-- -->\n<!--   -->\nThen I read the file.",
+	];
+	for (const raw of samples) {
+		const displayed = __testing.splitTranslationLines(formatThinkingForDisplay(raw, true));
+		assert.notEqual(displayed.length, 0, `host displayed nothing for ${JSON.stringify(raw)}`);
+		for (const line of displayed) {
+			if (!__testing.shouldTranslateLine(line)) continue;
+			assert.equal(__testing.isCompleteBlockLine(raw, line), true, `display line has no slot: ${JSON.stringify(line)}`);
+		}
+	}
 });
 
 test("cellKey separates translator model and target language", () => {
