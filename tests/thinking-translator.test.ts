@@ -189,3 +189,69 @@ test("splitTranslationLines trims outer indent but keeps internal spacing", () =
 	assert.deepEqual(__testing.splitTranslationLines("  foo  bar  \n  baz   qux  "), ["foo  bar", "baz   qux"]);
 });
 
+test("buildLateRows omits translations whose boxes were already painted", () => {
+	const paintedOnly = __testing.buildLateRows(
+		[{ blockLabel: "第 1 块", text: "已经画进框里", painted: true }],
+		undefined,
+		false,
+	);
+	assert.equal(paintedOnly, undefined);
+
+	const mixed = __testing.buildLateRows(
+		[
+			{ blockLabel: "第 1 块", text: "已经画进框里", painted: true },
+			{ blockLabel: "第 1 块", text: "还没有画上", painted: false },
+		],
+		undefined,
+		false,
+	);
+	assert.equal(mixed?.text, "思考翻译 · 第 1 块\n还没有画上");
+});
+
+test("buildLateRows merges back-to-back late translations into one payload", () => {
+	const payload = __testing.buildLateRows(
+		[
+			{ blockLabel: "第 2 块", text: "第一段译文", painted: false },
+			{ blockLabel: "第 2 块", text: "第二段译文", painted: false },
+		],
+		undefined,
+		false,
+	);
+	assert.equal(payload?.text, "思考翻译 · 第 2 块\n第一段译文\n第二段译文");
+});
+
+test("buildLateRows carries the previous payload only while coalescing is possible", () => {
+	const previous = __testing.buildLateRows(
+		[{ blockLabel: "第 2 块", text: "上一段译文", painted: false }],
+		undefined,
+		false,
+	);
+	assert.ok(previous);
+
+	const merged = __testing.buildLateRows(
+		[{ blockLabel: "第 2 块", text: "新的一段译文", painted: false }],
+		previous,
+		true,
+	);
+	assert.equal(merged?.text, "思考翻译 · 第 2 块\n上一段译文\n新的一段译文");
+
+	const fresh = __testing.buildLateRows(
+		[{ blockLabel: "第 3 块", text: "下一块译文", painted: false }],
+		previous,
+		false,
+	);
+	assert.equal(fresh?.text, "思考翻译 · 第 3 块\n下一块译文");
+});
+
+test("buildLateRows keeps distinct block sources in one header line", () => {
+	const payload = __testing.buildLateRows(
+		[
+			{ blockLabel: "第 1 块", text: "第一块译文", painted: false },
+			{ blockLabel: "第 2 块", text: "第二块译文", painted: false },
+		],
+		undefined,
+		false,
+	);
+	assert.equal(payload?.text, "思考翻译 · 第 1 块、第 2 块\n第一块译文\n第二块译文");
+});
+
