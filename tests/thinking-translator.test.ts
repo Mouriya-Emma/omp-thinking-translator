@@ -112,6 +112,29 @@ test("isCompleteBlockLine accepts host rewrites and rejects reveal prefixes", ()
 });
 
 /**
+ * 实测的缺陷：上一条消息的 thinking 组件在下一条消息里仍会被重绘。
+ * 按块下标认原文时，它拿到的是新块的原文，整块思考一句都译不出来。
+ */
+test("a line still matches while a newer thinking block is in flight", () => {
+	const older = { raw: "The queue drains at 120 per second.\nSo the retry budget matters.", ended: true };
+	const newer = { raw: "Now I need to compare the three settings", ended: false };
+	const blocks = [older, newer];
+	assert.equal(__testing.isLineOfTrackedBlocks(blocks, "The queue drains at 120 per second."), true);
+	assert.equal(__testing.isLineOfTrackedBlocks(blocks, "So the retry budget matters."), true);
+	// 只看新块时，旧块的行就是"查不到原文"，这正是整段不翻译的现场。
+	assert.equal(__testing.isLineOfTrackedBlocks([newer], "So the retry budget matters."), false);
+});
+
+test("the tail of a streaming block waits for that block to end", () => {
+	const raw = "The queue drains at 120 per second.\nSo the retry budget";
+	// 生成中：原文末尾只是"暂时到这儿"，这一行还会继续长。
+	assert.equal(__testing.isLineOfTrackedBlocks([{ raw, ended: false }], "So the retry budget"), false);
+	assert.equal(__testing.isLineOfTrackedBlocks([{ raw, ended: false }], "The queue drains at 120 per second."), true);
+	// 收尾后（含 provider 漏发 thinking_end、由 message_end 兜底的情况）末行才定型。
+	assert.equal(__testing.isLineOfTrackedBlocks([{ raw, ended: true }], "So the retry budget"), true);
+});
+
+/**
  * 宿主真的会改写展示文本：prose-only 模式下折叠代码围栏、补省略号、吃掉句末句号、丢掉空注释。
  * 这些改写过的行必须仍能认回原文，否则它们在译文框里永远没有自己的格。
  */

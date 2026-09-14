@@ -17,6 +17,8 @@ type TranslationProgress =
  * 组件的 render，这一位因此能区分"已经画上去了"和"永远画不上去了"。
  */
 type TranslationCell = { progress: TranslationProgress; painted: boolean };
+/** 一个 thinking 块的原文与收尾状态；收尾后末行才定型，可以进入分发。 */
+type LiveBlock = { raw: string; ended: boolean };
 type ResolvedTranslatorConfig = {
 	enabled: boolean;
 	targetLanguage: string;
@@ -40,6 +42,10 @@ const DEFAULT_CONFIG: ResolvedTranslatorConfig = {
 const LATE_WIDGET_KEY = "thinking-translator-late";
 const LATE_WIDGET_ENTRIES = 3;
 const LATE_WIDGET_DEBOUNCE_MS = 400;
+/** 翻译模型不在线或限流时的退避重试间隔；用尽才把这一行标成失败。 */
+const RETRY_DELAYS_MS = [500, 2000, 6000];
+/** 追踪的 thinking 块上限：更早的块早已提交进历史，译文也已在缓存里。 */
+const MAX_TRACKED_BLOCKS = 32;
 const configErrorNotified = new Set<string>();
 const translationFailureNotified = new Set<string>();
 let missingModelWarningKey: string | undefined;
@@ -55,10 +61,9 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	let latestContext: ExtensionContext | undefined;
 	let requestRender: (() => void) | undefined;
 	let controller = new AbortController();
-	// 本条消息里每个 thinking 块的原始文本，用来判断展示行属于当前消息而非历史回放。
-	const liveBlocks = new Map<number, string>();
-	const endedBlocks = new Set<number>();
-	let messageInFlight = false;
+	// 本进程里观察到的 thinking 块原文与收尾状态。判定"这一行属于生成中的块"靠内容匹配而不是
+	// contentIndex：组件重建的时机与消息边界不对齐，任何按索引的键都会在下一条消息里指错块。
+	const liveBlocks = new Map<string, LiveBlock>();
 
 	/**
 	 * 兜底 widget 的内容是派生状态：当前 thinking 块里"已完成但一个字都没画出去"的译文。
@@ -73,6 +78,8 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	pi.registerAssistantThinkingRenderer((context, theme) => {
 		// 展示文本每次变化都会重建组件，工厂期的拆分就是当前可见行。
 		const sources = splitTranslationLines(context.text);
+		// 只用于兜底 widget 的分组：下一个块的译文完成时，上一个块的残留让位。
+		const block = blockKey(messageSeq, context.contentIndex);
 		requestRender = context.requestRender;
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		const title = new Text("", 0, 0);
@@ -81,7 +88,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		box.addChild(body);
 		return {
 			render(width: number): readonly string[] {
-				dispatch(context.contentIndex, sources, context.requestRender);
+				dispatch(sources, context.requestRender, block);
 				const config = activeConfig;
 				if (!config) return [];
 				const cells: TranslationCell[] = [];
@@ -92,18 +99,24 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 				if (cells.length === 0) return [];
 				let completed = 0;
 				let painted = false;
+				const rows: string[] = [];
 				for (const cell of cells) {
 					if (cell.progress.status === "done" || cell.progress.status === "error") completed++;
-					// 只要这一格已经有正文画出去，框里就看得见译文；真正需要兜底的是一个字都没画上的格。
-					if (cell.progress.status === "done" || (cell.progress.status === "streaming" && cell.progress.translation.length > 0)) {
+					const text = cellBody(cell);
+					if (text === undefined) continue;
+					rows.push(text);
+					// 有正文画出去，框里就看得见译文；真正需要兜底的是一个字都没画上的格。
+					if (cell.progress.status === "done") {
 						if (!cell.painted) painted = true;
 						cell.painted = true;
 					}
 				}
 				// 这一帧刚画上的译文可能正挂在 widget 里等着被撤掉。
 				if (painted) scheduleLateRefresh();
+				// 还没有任何译文时不占版面：等待中的行只计入标题的计数。
+				if (rows.length === 0) return [];
 				title.setText(theme.fg("accent", `思考翻译 · 块 ${context.thinkingIndex + 1} · ${completed}/${cells.length}`));
-				body.setText(cells.map(formatTranslationCell).join("\n\n"));
+				body.setText(rows.join("\n\n"));
 				return box.render(width);
 			},
 			invalidate(): void {
@@ -163,8 +176,6 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		translations.clear();
 		clearLateWidget();
 		liveBlocks.clear();
-		endedBlocks.clear();
-		messageInFlight = false;
 		activeConfig = undefined;
 		latestContext = undefined;
 		configErrorNotified.clear();
@@ -178,19 +189,18 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 
 	/**
 	 * 分发点在渲染期：只有这里知道宿主最终展示了哪些行。
-	 * 生成中的末行每次重绘都会变成新键，等本块收尾再译；历史块的行不属于当前消息，不重译。
+	 * 一行要译的前提是它是某个"本进程观察到的 thinking 块"里的完整行：
+	 * 生成中的末行只是揭示到一半的前缀，每次重绘都是新键，等这一块收尾才算数；
+	 * 历史回放的块没有原文记录，因此整片 scrollback 不会被重译。
 	 * 重绘回调取自发起分发的那个组件，而不是模块里"最后一次"的那个：后者会被下一块的工厂覆盖，
 	 * 译文回来时催的就不是自己那一块。
 	 */
-	function dispatch(contentIndex: number, sources: readonly string[], notify: () => void): void {
+	function dispatch(sources: readonly string[], notify: () => void, block: string): void {
 		const ctx = latestContext;
-		const raw = liveBlocks.get(contentIndex);
-		if (!ctx || raw === undefined || sources.length === 0) return;
-		const settled = !messageInFlight || endedBlocks.has(contentIndex);
-		const candidates = settled ? sources : sources.slice(0, -1);
+		if (!ctx || sources.length === 0) return;
 		const config = (activeConfig ??= loadConfig(ctx));
 		if (!config.enabled) return;
-		const missing = candidates.filter((line) => shouldTranslateLine(line) && isCompleteBlockLine(raw, line) && !translations.has(cellKey(config, line)));
+		const missing = sources.filter((line) => shouldTranslateLine(line) && isTrackedBlockLine(line) && !translations.has(cellKey(config, line)));
 		if (missing.length === 0) return;
 		const model = resolveTranslatorModel(ctx, config);
 		if (!model) return;
@@ -200,9 +210,13 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			if (translations.has(key)) continue;
 			const cell: TranslationCell = { progress: { status: "pending" }, painted: false };
 			translations.set(key, cell);
-			const block = `${messageSeq}:${contentIndex}`;
 			void translateLine(cell, line, ctx, config, model, controller.signal, notify).then(() => noteTranslationSettled(cell, block));
 		}
+	}
+
+	/** 这一行是否属于任一在追踪的块。 */
+	function isTrackedBlockLine(line: string): boolean {
+		return isLineOfTrackedBlocks(liveBlocks.values(), line);
 	}
 
 	/**
@@ -229,10 +243,12 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		latestContext = ctx;
 		// thinking 增量事件太密，配置每条消息只读一次盘；这里直接换成新值，render 永远有键可用。
 		activeConfig = loadConfig(ctx);
-		liveBlocks.clear();
-		endedBlocks.clear();
-		messageInFlight = true;
 		messageSeq++;
+		// 上一条消息的块原文要留着：它的组件还在被重绘，逐行匹配得拿自己那份原文。
+		for (const key of liveBlocks.keys()) {
+			if (liveBlocks.size <= MAX_TRACKED_BLOCKS) break;
+			liveBlocks.delete(key);
+		}
 	});
 
 	pi.on("message_update", (event, ctx) => {
@@ -240,36 +256,42 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		const blockEvent = event.assistantMessageEvent;
 		if (blockEvent.type === "thinking_delta") {
 			// thinking_delta 只带增量，累积文本从 partial 的同一内容块读取。
-			const block = blockEvent.partial.content[blockEvent.contentIndex];
-			if (block?.type === "thinking") liveBlocks.set(blockEvent.contentIndex, block.thinking);
+			const content = blockEvent.partial.content[blockEvent.contentIndex];
+			if (content?.type === "thinking") {
+				liveBlocks.set(blockKey(messageSeq, blockEvent.contentIndex), { raw: content.thinking, ended: false });
+			}
 			return;
 		}
 		if (blockEvent.type !== "thinking_end") return;
-		liveBlocks.set(blockEvent.contentIndex, blockEvent.content);
-		endedBlocks.add(blockEvent.contentIndex);
+		liveBlocks.set(blockKey(messageSeq, blockEvent.contentIndex), { raw: blockEvent.content, ended: true });
 		// 末行此刻才定型，催一次重绘让它进入分发。
 		requestRender?.();
 	});
 
-	// 中断或 provider 漏发 thinking_end 时，这里是末行唯一的收尾机会。
+	// 中断或 provider 漏发 thinking_end 时，这里是末行唯一的收尾机会：
+	// 没有 thinking_end 的块也必须变成"已收尾"，否则它的末行永远等不到翻译。
 	pi.on("message_end", (_event, ctx) => {
 		latestContext = ctx;
-		messageInFlight = false;
+		for (const live of liveBlocks.values()) live.ended = true;
 		requestRender?.();
 	});
 }
 
-/** 渲染顺序由可见行顺序决定，晚到的译文仍落在自己的行位。 */
-function formatTranslationCell(cell: TranslationCell): string {
+/**
+ * 只有真正有正文的格才占行：等待中和刚开始流式（还没有一个字）的格返回 undefined，
+ * 进度只体现在标题的计数里。否则一个五行的 thinking 会先撑出五行"等待翻译…"，
+ * 而且一旦这几行被宿主提交进原生历史，那片占位就永久留在 scrollback 里。
+ */
+function cellBody(cell: TranslationCell): string | undefined {
 	switch (cell.progress.status) {
 		case "pending":
-			return "等待翻译…";
+			return undefined;
 		case "streaming":
-			return cell.progress.translation || "翻译中…";
+			return cell.progress.translation || undefined;
 		case "done":
 			return cell.progress.translation;
 		case "error":
-			return `翻译失败：${cell.progress.error.replace(/\s+/g, " ").slice(0, 120)}`;
+			return `翻译失败：${cell.progress.error.replace(/\s+/g, " ").slice(0, 80)}`;
 	}
 }
 
@@ -283,34 +305,74 @@ async function translateLine(
 	signal: AbortSignal,
 	requestRender: () => void,
 ): Promise<void> {
-	try {
-		const auth = await getTranslatorAuth(ctx, translatorModel);
-		if (signal.aborted) return;
-		const prompt = buildTranslationPrompt(source, config.targetLanguage);
-		const eventStream = stream(
-			translatorModel,
-			{ messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(8192, Math.max(1024, Math.ceil(source.length * 1.3))), signal },
-		);
-		let translation = "";
-		for await (const event of eventStream) {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await streamTranslation(cell, source, ctx, config, translatorModel, signal, requestRender);
+			return;
+		} catch (error) {
 			if (signal.aborted) return;
-			if (event.type === "error") throw new Error(event.error.errorMessage || `translation ${event.reason}`);
-			if (event.type === "text_delta") {
-				translation += event.delta;
-				cell.progress = { status: "streaming", translation };
-				requestRender();
-			}
+			const message = error instanceof Error ? error.message : String(error);
+			// 翻译模型不在线、限流、连接中断都是可恢复的：退避重试，中途保持"等待"而不是先报错。
+			if (attempt + 1 < RETRY_DELAYS_MS.length + 1 && (await sleepUnlessAborted(RETRY_DELAYS_MS[attempt]!, signal))) continue;
+			if (signal.aborted) return;
+			cell.progress = { status: "error", error: message };
+			requestRender();
+			notifyTranslationFailure(ctx, error);
+			return;
 		}
-		if (signal.aborted) return;
-		cell.progress = { status: "done", translation: cleanTranslation(translation) };
-		requestRender();
-	} catch (error) {
-		if (signal.aborted) return;
-		cell.progress = { status: "error", error: error instanceof Error ? error.message : String(error) };
-		requestRender();
-		notifyTranslationFailure(ctx, error);
 	}
+}
+
+/** 退避等待；被中止时返回 false，让调用方放弃重试。 */
+function sleepUnlessAborted(delay: number, signal: AbortSignal): Promise<boolean> {
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	const onAbort = (): void => {
+		clearTimeout(timer);
+		resolve(false);
+	};
+	const timer = setTimeout(() => {
+		signal.removeEventListener("abort", onAbort);
+		resolve(!signal.aborted);
+	}, delay);
+	timer.unref?.();
+	signal.addEventListener("abort", onAbort, { once: true });
+	return promise;
+}
+
+/** 一次请求的完整消费；任何失败都抛给上层决定是否重试。 */
+async function streamTranslation(
+	cell: TranslationCell,
+	source: string,
+	ctx: ExtensionContext,
+	config: ResolvedTranslatorConfig,
+	translatorModel: Model<Api>,
+	signal: AbortSignal,
+	requestRender: () => void,
+): Promise<void> {
+	const auth = await getTranslatorAuth(ctx, translatorModel);
+	if (signal.aborted) return;
+	const prompt = buildTranslationPrompt(source, config.targetLanguage);
+	const eventStream = stream(
+		translatorModel,
+		{ messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
+		{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(8192, Math.max(1024, Math.ceil(source.length * 1.3))), signal },
+	);
+	let translation = "";
+	for await (const event of eventStream) {
+		if (signal.aborted) return;
+		if (event.type === "error") throw new Error(event.error.errorMessage || `translation ${event.reason}`);
+		if (event.type === "text_delta") {
+			translation += event.delta;
+			cell.progress = { status: "streaming", translation };
+			requestRender();
+		}
+	}
+	if (signal.aborted) return;
+	// 空响应按失败处理：重试一次往往就有内容，直接落空格只会留下一行空白。
+	const cleaned = cleanTranslation(translation);
+	if (!cleaned) throw new Error("translator returned empty text");
+	cell.progress = { status: "done", translation: cleaned };
+	requestRender();
 }
 
 /** 键里带上模型与目标语言，改配置后不会复用上一轮的译文。 */
@@ -328,18 +390,36 @@ function splitTranslationLines(text: string): string[] {
  * 展示行必须是这一块原始 thinking 里的一整行。
  * 流式揭示会把行截成前缀（`thinking_end` 之后仍在继续揭示），这种前缀每次重绘都是新键，必须挡住；
  * 宿主折叠代码围栏时又会把前一行改写成省略号收尾、甚至吃掉句末句号，这两种改写要能对上。
- * 历史消息的展示行对不上当前块的原文，因此也不会被重复翻译。
+ * `blockEnded` 为假时原文本身还在增长，落在原文末尾的匹配只是"暂时到这儿"，不能当成整行。
+ * 历史消息的展示行对不上任何在追踪的块原文，因此也不会被重复翻译。
  */
-function isCompleteBlockLine(raw: string, line: string): boolean {
+function isCompleteBlockLine(raw: string, line: string, blockEnded = true): boolean {
 	const normalized = line.replace(/(?:\.{3}|…)$/, "").trimEnd();
 	if (!normalized) return false;
+	// 行尾允许残留被改写吃掉的句末标点和行内空白，但后面必须就是换行（块已收尾时也可以是块尾）。
+	const boundary = blockEnded ? /^[.。…]*[^\S\n]*(?:\n|$)/ : /^[.。…]*[^\S\n]*\n/;
 	for (let from = 0; ; from = from + 1) {
 		const index = raw.indexOf(normalized, from);
 		if (index < 0) return false;
-		// 行尾允许残留被改写吃掉的句末标点和行内空白，但后面必须就是换行或块尾。
-		if (/^[.。…]*[^\S\n]*(?:\n|$)/.test(raw.slice(index + normalized.length))) return true;
+		if (boundary.test(raw.slice(index + normalized.length))) return true;
 		from = index;
 	}
+}
+
+/**
+ * 一行只要是任一在追踪的块里的完整行就该翻译：宿主重建组件的时机和消息边界不对齐，
+ * 上一条消息的 thinking 组件在下一条消息里仍会被重绘，按块下标去认原文必然指错块。
+ */
+function isLineOfTrackedBlocks(blocks: Iterable<LiveBlock>, line: string): boolean {
+	for (const block of blocks) {
+		if (isCompleteBlockLine(block.raw, line, block.ended)) return true;
+	}
+	return false;
+}
+
+/** 块标识：消息序号 + 内容块下标。 */
+function blockKey(messageSeq: number, contentIndex: number): string {
+	return `${messageSeq}:${contentIndex}`;
 }
 
 /** 配置只在显式初始化时写入，避免启动扩展就改动用户文件。 */
@@ -569,6 +649,7 @@ export const __testing = {
 	cellKey,
 	cleanTranslation,
 	isCompleteBlockLine,
+	isLineOfTrackedBlocks,
 	getProjectConfigPath,
 	getGlobalConfigPath,
 	mergeConfig,

@@ -20,7 +20,7 @@
     "translation"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit --skipLibCheck --moduleResolution bundler --module esnext --target es2022 --types node extensions/thinking-translator.ts",
+    "typecheck": "tsc --noEmit --skipLibCheck --moduleResolution bundler --module esnext --target es2024 --types node extensions/thinking-translator.ts",
     "test": "bun test tests/thinking-translator.test.ts",
     "check": "pnpm typecheck && pnpm test"
   },
