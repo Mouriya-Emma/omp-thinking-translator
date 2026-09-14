@@ -173,7 +173,8 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			if (lateTranslations.length > LATE_WIDGET_ENTRIES) lateTranslations.shift();
 			ctx.ui?.setWidget?.(
 				LATE_WIDGET_KEY,
-				["思考翻译 · 已滚出可重绘区域", ...lateTranslations.map((text) => `· ${text.replace(/\s+/g, " ").slice(0, 300)}`)],
+				// widget 的行是纯文本组件，译文里的 Markdown 强调标记只会原样露出来，这里去掉。
+				["思考翻译 · 已滚出可重绘区域", ...lateTranslations.map((text) => `· ${text.replace(/\*\*|__/g, "").replace(/\s+/g, " ").slice(0, 300)}`)],
 				{ placement: "aboveEditor" },
 			);
 		}, LATE_PAINT_GRACE_MS);
