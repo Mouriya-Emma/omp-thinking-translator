@@ -95,20 +95,36 @@ test("shouldTranslateLine accepts foreign lines of any length and rejects the re
 	assert.equal(__testing.shouldTranslateLine(""), false);
 });
 
-test("isCompleteBlockLine accepts host rewrites and rejects reveal prefixes", () => {
+test("matchBlockLine returns the raw line for host rewrites and rejects reveal prefixes", () => {
 	const raw = "Check the parser first.\n```ts\nconst x = 1;\n```\nThen run the tests.";
-	assert.equal(__testing.isCompleteBlockLine(raw, "Check the parser first."), true);
-	assert.equal(__testing.isCompleteBlockLine(raw, "Then run the tests."), true);
-	// 宿主折叠代码围栏时会把前一行改成省略号收尾，有时还吃掉句末句号。
-	assert.equal(__testing.isCompleteBlockLine(raw, "Check the parser first...."), true);
-	assert.equal(__testing.isCompleteBlockLine(raw, "Check the parser first…"), true);
+	assert.equal(__testing.matchBlockLine(raw, "Check the parser first."), "Check the parser first.");
+	assert.equal(__testing.matchBlockLine(raw, "Then run the tests."), "Then run the tests.");
+	// 宿主折叠代码围栏时会把前一行改成省略号收尾，有时还吃掉句末句号；都要认回同一原文行。
+	assert.equal(__testing.matchBlockLine(raw, "Check the parser first...."), "Check the parser first.");
+	assert.equal(__testing.matchBlockLine(raw, "Check the parser first…"), "Check the parser first.");
 	// 流式揭示的前缀每次重绘都是新键，必须挡住，否则一行会被翻译成好几份。
-	assert.equal(__testing.isCompleteBlockLine(raw, "Check the par"), false);
-	assert.equal(__testing.isCompleteBlockLine(raw, "Then run the te"), false);
+	assert.equal(__testing.matchBlockLine(raw, "Check the par"), undefined);
+	assert.equal(__testing.matchBlockLine(raw, "Then run the te"), undefined);
 	// 历史消息的行不属于当前块，不会被重新分发。
-	assert.equal(__testing.isCompleteBlockLine(raw, "A line from an older message."), false);
+	assert.equal(__testing.matchBlockLine(raw, "A line from an older message."), undefined);
 	// 块尾没有换行时末行仍然算完整。
-	assert.equal(__testing.isCompleteBlockLine("Only one line here.", "Only one line here."), true);
+	assert.equal(__testing.matchBlockLine("Only one line here.", "Only one line here."), "Only one line here.");
+});
+
+/**
+ * 实测的缺陷：揭示到句末句号前一个字符的那一帧，展示行只比原文少一个句号，会被当成完整行接受；
+ * 若按展示行做键，它和下一帧的完整行是两个格，同一行翻两次，先完成的那格再也画不上去，只能走迟到通知。
+ */
+test("a reveal frame missing only the final period shares the full line's cell", () => {
+	const raw = "I am trying to recall who Tibo is, possibly focused on screen-time or focus.\n\nActually, this might be Tibo Louis-Lucas.\n";
+	const streaming = [{ raw, ended: false }];
+	const full = "I am trying to recall who Tibo is, possibly focused on screen-time or focus.";
+	assert.equal(__testing.resolveTrackedLine(streaming, full.slice(0, -1)), full);
+	assert.equal(__testing.resolveTrackedLine(streaming, full), full);
+	assert.equal(
+		__testing.cellKey(__testing.DEFAULT_CONFIG, __testing.resolveTrackedLine(streaming, full.slice(0, -1))!),
+		__testing.cellKey(__testing.DEFAULT_CONFIG, __testing.resolveTrackedLine(streaming, full)!),
+	);
 });
 
 /**
@@ -119,19 +135,19 @@ test("a line still matches while a newer thinking block is in flight", () => {
 	const older = { raw: "The queue drains at 120 per second.\nSo the retry budget matters.", ended: true };
 	const newer = { raw: "Now I need to compare the three settings", ended: false };
 	const blocks = [older, newer];
-	assert.equal(__testing.isLineOfTrackedBlocks(blocks, "The queue drains at 120 per second."), true);
-	assert.equal(__testing.isLineOfTrackedBlocks(blocks, "So the retry budget matters."), true);
+	assert.equal(__testing.resolveTrackedLine(blocks, "The queue drains at 120 per second."), "The queue drains at 120 per second.");
+	assert.equal(__testing.resolveTrackedLine(blocks, "So the retry budget matters."), "So the retry budget matters.");
 	// 只看新块时，旧块的行就是"查不到原文"，这正是整段不翻译的现场。
-	assert.equal(__testing.isLineOfTrackedBlocks([newer], "So the retry budget matters."), false);
+	assert.equal(__testing.resolveTrackedLine([newer], "So the retry budget matters."), undefined);
 });
 
 test("the tail of a streaming block waits for that block to end", () => {
 	const raw = "The queue drains at 120 per second.\nSo the retry budget";
 	// 生成中：原文末尾只是"暂时到这儿"，这一行还会继续长。
-	assert.equal(__testing.isLineOfTrackedBlocks([{ raw, ended: false }], "So the retry budget"), false);
-	assert.equal(__testing.isLineOfTrackedBlocks([{ raw, ended: false }], "The queue drains at 120 per second."), true);
+	assert.equal(__testing.resolveTrackedLine([{ raw, ended: false }], "So the retry budget"), undefined);
+	assert.equal(__testing.resolveTrackedLine([{ raw, ended: false }], "The queue drains at 120 per second."), "The queue drains at 120 per second.");
 	// 收尾后（含 provider 漏发 thinking_end、由 message_end 兜底的情况）末行才定型。
-	assert.equal(__testing.isLineOfTrackedBlocks([{ raw, ended: true }], "So the retry budget"), true);
+	assert.equal(__testing.resolveTrackedLine([{ raw, ended: true }], "So the retry budget"), "So the retry budget");
 });
 
 /**
@@ -150,7 +166,7 @@ test("every line the host still displays matches its raw thinking", () => {
 		assert.notEqual(displayed.length, 0, `host displayed nothing for ${JSON.stringify(raw)}`);
 		for (const line of displayed) {
 			if (!__testing.shouldTranslateLine(line)) continue;
-			assert.equal(__testing.isCompleteBlockLine(raw, line), true, `display line has no slot: ${JSON.stringify(line)}`);
+			assert.notEqual(__testing.matchBlockLine(raw, line), undefined, `display line has no slot: ${JSON.stringify(line)}`);
 		}
 	}
 });

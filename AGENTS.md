@@ -14,9 +14,9 @@ Everything lives in `extensions/thinking-translator.ts` (default export `thinkin
 flowchart LR
   H[host thinking events] -->|message_start / thinking_delta / thinking_end / message_end| T[tracked blocks map<br/>partial text + ended flag, cap 32]
   H -->|registerAssistantThinkingRenderer<br/>context.text = host display text| R[renderer: Box + Text title + Markdown body]
-  R --> D[dispatch: split lines → shouldTranslateLine → isTrackedBlockLine]
+  R --> D[dispatch: split lines → shouldTranslateLine → resolveTrackedLine → canonical raw line]
   T --> D
-  D -->|uncached line| C[cells Map<br/>key = provider/id + targetLanguage + line]
+  D -->|uncached canonical line| C[cells Map<br/>key = provider/id + targetLanguage + raw line]
   C --> S[translateLine → streamTranslation<br/>pi-ai stream, retries 500/2000/6000 ms]
   S -->|deltas → requestRender| R
   C -->|done but never painted| L[lateQueue → 400 ms debounce → buildLateRows → ctx.ui.notify]
@@ -25,7 +25,7 @@ flowchart LR
 Key invariants (deliberate; do not "simplify" them):
 
 - **Host display text is the source of truth.** The renderer translates `context.text` (post-`formatThinkingForDisplay`), not raw event text. `tests/thinking-translator.test.ts:141-156` pins the host rewrite contract by importing the host source from `node_modules`.
-- **Block matching is by content, not `contentIndex`.** `isTrackedBlockLine` (`~:416-445`) accepts a line only when it is a *complete* line of a tracked block, tolerating host ellipsis/punctuation rewrites and rejecting a growing block's partial last line. Index-based matching mis-attributes blocks across renderer rebuilds.
+- **Block matching is by content, not `contentIndex`, and yields the canonical raw line.** `matchBlockLine`/`resolveTrackedLine` accept a display line only when it is a *complete* line of a tracked block, tolerating host ellipsis/punctuation rewrites and rejecting a growing block's partial last line, and return the raw line it matched. The raw line — not the display variant — is the cell key and translation source: during the reveal a frame that lacks only the final period is also accepted, and keying by display text would translate that line twice (the first cell never gets painted and leaks into a late notify row). Index-based matching mis-attributes blocks across renderer rebuilds.
 - **Per-line Latin gate.** `shouldTranslateLine` requires Latin chars to outnumber CJK chars.
 - **Cache key** includes model and language so switching either invalidates; the cell map survives message boundaries so history still renders.
 - **No placeholders.** Pending/empty rows are omitted; box title shows `done/total`; repaint via `context.requestRender`.
@@ -74,7 +74,7 @@ Config precedence: defaults < global < project, merged per field (including `tra
 - **TypeScript ESM, strict-ish, no lint/format config** (no Biome/ESLint/Prettier, no tsconfig). Match the existing style by eye: 2-space indent, double quotes, trailing semicolons, `const` arrow/function declarations.
 - **Closure-based module state**, not classes: `Map`s for cells/blocks, a `lateQueue`, timers (`unref`'d), one shared `AbortController`. Helpers are plain functions defined after the export.
 - **Types over runtime checks inside; parse at the boundary.** Config JSON is read as `unknown` and normalized by `mergeConfig`/`normalizeTranslatorModel` into a resolved record. `TranslationProgress` is a discriminated union (`pending | streaming | done | error`); payloads are `Readonly`.
-- **Pure helpers are test-exported** through the `__testing` object at the bottom of the file (`mergeConfig`, `shouldTranslateLine`, `isCompleteBlockLine`, `isLineOfTrackedBlocks`, `splitTranslationLines`, `cellKey`, `cleanTranslation`, `buildLateRows`, config path helpers, `DEFAULT_CONFIG`). New pure logic goes there; new tests target those, not the extension lifecycle.
+- **Pure helpers are test-exported** through the `__testing` object at the bottom of the file (`mergeConfig`, `shouldTranslateLine`, `matchBlockLine`, `resolveTrackedLine`, `splitTranslationLines`, `cellKey`, `cleanTranslation`, `buildLateRows`, config path helpers, `DEFAULT_CONFIG`). New pure logic goes there; new tests target those, not the extension lifecycle.
 - **Errors are values or one-shot notifications.** Expected failures (bad config, missing model, exhausted retries) become state (`enabled:false`, `error` cell) plus a deduplicated `ctx.ui.notify`; nothing throws into the host. Credential lookup failures are wrapped in diagnostic `Error`s for retry handling.
 - **Async: fire-and-forget per line**, streaming via `for await` over `pi-ai` events, redraw on every text delta, abort-aware (`signal.aborted` checks return early without erroring).
 - **Prompting.** The translator prompt treats the source as inert data and forbids answering/summarizing/adding code; `cleanTranslation` strips code fences, `<thinking>`/`<text>` wrappers and the "原文保持不变" phrase. Keep both if you change the prompt.

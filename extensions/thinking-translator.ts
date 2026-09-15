@@ -121,7 +121,8 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 				if (!config) return [];
 				const cells: TranslationCell[] = [];
 				for (const source of sources) {
-					const cell = translations.get(cellKey(config, source));
+					// 揭示中的展示变体（缺句号、省略号收尾）都指向同一格；对不上追踪块的历史行按展示文本查。
+					const cell = translations.get(cellKey(config, resolveTrackedLine(liveBlocks.values(), source) ?? source));
 					if (cell) cells.push(cell);
 				}
 				if (cells.length === 0) return [];
@@ -238,7 +239,13 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		if (!ctx || sources.length === 0) return;
 		const config = (activeConfig ??= loadConfig(ctx));
 		if (!config.enabled) return;
-		const missing = sources.filter((line) => shouldTranslateLine(line) && isTrackedBlockLine(line) && !translations.has(cellKey(config, line)));
+		// 展示行先映射回原文里的整行：揭示中的变体（缺句号、省略号收尾）与最终展示共用同一格。
+		const missing: string[] = [];
+		for (const line of sources) {
+			if (!shouldTranslateLine(line)) continue;
+			const canonical = resolveTrackedLine(liveBlocks.values(), line);
+			if (canonical !== undefined && !translations.has(cellKey(config, canonical))) missing.push(canonical);
+		}
 		if (missing.length === 0) return;
 		const signal = controller.signal;
 		// 先占格：模型解析可能要等一次网络发现，期间的重绘不能再为同一行发起分发。
@@ -264,11 +271,6 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 				void translateLine(cell, line, ctx, config, model, signal, notify).then(() => noteTranslationSettled(cell, blockLabel, signal));
 			}
 		});
-	}
-
-	/** 这一行是否属于任一在追踪的块。 */
-	function isTrackedBlockLine(line: string): boolean {
-		return isLineOfTrackedBlocks(liveBlocks.values(), line);
 	}
 
 	/**
@@ -433,34 +435,43 @@ function splitTranslationLines(text: string): string[] {
 }
 
 /**
- * 展示行必须是这一块原始 thinking 里的一整行。
+ * 展示行必须是这一块原始 thinking 里的一整行；命中时返回原文里那一整行（去掉首尾空白），作为译文格的键与翻译原文。
  * 流式揭示会把行截成前缀（`thinking_end` 之后仍在继续揭示），这种前缀每次重绘都是新键，必须挡住；
  * 宿主折叠代码围栏时又会把前一行改写成省略号收尾、甚至吃掉句末句号，这两种改写要能对上。
+ * 揭示到句末句号前一个字符的那一帧同样会被当成"少了句号的完整行"接受——所以键不能取展示行本身：
+ * 同一原文行的每个展示变体都必须落到同一格，否则一行会翻两次，先完成的那格再也画不上去，只能走迟到通知。
  * `blockEnded` 为假时原文本身还在增长，落在原文末尾的匹配只是"暂时到这儿"，不能当成整行。
  * 历史消息的展示行对不上任何在追踪的块原文，因此也不会被重复翻译。
  */
-function isCompleteBlockLine(raw: string, line: string, blockEnded = true): boolean {
+function matchBlockLine(raw: string, line: string, blockEnded = true): string | undefined {
 	const normalized = line.replace(/(?:\.{3}|…)$/, "").trimEnd();
-	if (!normalized) return false;
+	if (!normalized) return undefined;
 	// 行尾允许残留被改写吃掉的句末标点和行内空白，但后面必须就是换行（块已收尾时也可以是块尾）。
 	const boundary = blockEnded ? /^[.。…]*[^\S\n]*(?:\n|$)/ : /^[.。…]*[^\S\n]*\n/;
 	for (let from = 0; ; from = from + 1) {
 		const index = raw.indexOf(normalized, from);
-		if (index < 0) return false;
-		if (boundary.test(raw.slice(index + normalized.length))) return true;
+		if (index < 0) return undefined;
+		const rest = raw.slice(index + normalized.length);
+		if (boundary.test(rest)) {
+			const lineStart = raw.lastIndexOf("\n", index) + 1;
+			const newline = rest.indexOf("\n");
+			const lineEnd = index + normalized.length + (newline < 0 ? rest.length : newline);
+			return raw.slice(lineStart, lineEnd).trim();
+		}
 		from = index;
 	}
 }
 
 /**
- * 一行只要是任一在追踪的块里的完整行就该翻译：宿主重建组件的时机和消息边界不对齐，
+ * 一行只要是任一在追踪的块里的完整行就该翻译，返回它在原文里的规范形式：宿主重建组件的时机和消息边界不对齐，
  * 上一条消息的 thinking 组件在下一条消息里仍会被重绘，按块下标去认原文必然指错块。
  */
-function isLineOfTrackedBlocks(blocks: Iterable<LiveBlock>, line: string): boolean {
+function resolveTrackedLine(blocks: Iterable<LiveBlock>, line: string): string | undefined {
 	for (const block of blocks) {
-		if (isCompleteBlockLine(block.raw, line, block.ended)) return true;
+		const canonical = matchBlockLine(block.raw, line, block.ended);
+		if (canonical !== undefined) return canonical;
 	}
-	return false;
+	return undefined;
 }
 
 /** 块标识：消息序号 + 内容块下标。 */
@@ -721,8 +732,8 @@ export const __testing = {
 	DEFAULT_CONFIG,
 	cellKey,
 	cleanTranslation,
-	isCompleteBlockLine,
-	isLineOfTrackedBlocks,
+	matchBlockLine,
+	resolveTrackedLine,
 	getProjectConfigPath,
 	getGlobalConfigPath,
 	mergeConfig,
