@@ -130,7 +130,7 @@ A complete config looks like this:
 | `enabled` | boolean | `true` | Enables translation processing. If no `translatorModel` is configured, translation is skipped with a warning. |
 | `targetLanguage` | string | `"Simplified Chinese"` | Target language passed to the translator model. Must be a non-empty string. |
 | `translatorModel` | object | unset | Translator model reference: `{ "provider": "...", "id": "..." }`. Both fields are required for the reference to take effect. |
-| `trace` | string | unset | Diagnostic only. Absolute path of a JSONL file; when set, the extension appends one record per step (`activate`, `message_start`, `thinking_end`, `factory`, `dispatch`, `resolve`, `request`, `done`/`translateError`, `render` on every cell-state change, `painted`, `settled`, `lateFlush`, `reset`, `missingModel`). Use it to see where a session's translation stops without reading the terminal. `null` clears a value inherited from the global file. |
+| `trace` | string \| boolean | `true` | Diagnostic record. `true` appends one JSONL record per step (`session_start`, `message_start`, `thinking_end`, `factory`, `dispatch`, `resolve`, `request`, `done`/`translateError`, `render` on every cell-state change, `painted`, `settled`, `lateFlush`, `reset`, `missingModel`) to `<session file without .jsonl>.thinking-translator-trace.jsonl` next to the session file; `--no-session` processes write nothing. A string sets an explicit path; `false` disables. |
 
 `contentTypes` and `minLatinChars`, left over from older config shapes, are silently ignored: only thinking blocks are translated, and translatability is decided per line rather than by a block-length threshold.
 

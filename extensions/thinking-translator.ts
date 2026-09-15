@@ -23,8 +23,11 @@ type ResolvedTranslatorConfig = {
 	enabled: boolean;
 	targetLanguage: string;
 	translatorModel?: ModelRef;
-	/** 诊断用：设了就把每一步（事件、分发、请求、渲染、迟到通知）以 JSONL 追加到这个文件。 */
-	trace?: string;
+	/**
+	 * 诊断记录（事件、分发、请求、渲染、迟到通知）的落点：默认写在会话文件旁边的
+	 * `<会话文件名>.thinking-translator-trace.jsonl`；字符串改成指定路径，`false` 关闭。
+	 */
+	trace: string | boolean;
 };
 type NotifyLevel = "info" | "warning" | "error";
 type NotifierContext = {
@@ -59,6 +62,7 @@ const CONFIG_FILE_NAME = "thinking-translator.json";
 const DEFAULT_CONFIG: ResolvedTranslatorConfig = {
 	enabled: true,
 	targetLanguage: "Simplified Chinese",
+	trace: true,
 };
 /** notify 行的去抖窗口；用于合并同一轮内接连完成的译文。 */
 const LATE_NOTIFY_DEBOUNCE_MS = 400;
@@ -66,14 +70,20 @@ const LATE_NOTIFY_DEBOUNCE_MS = 400;
 const RETRY_DELAYS_MS = [500, 2000, 6000];
 /** 追踪的 thinking 块上限：更早的块早已提交进历史，译文也已在缓存里。 */
 const MAX_TRACKED_BLOCKS = 32;
-/** 当前生效的 trace 文件；由最近一次加载的配置决定，默认关闭。 */
+/** 当前生效的 trace 文件；会话开始和每条消息开始时按配置与会话文件重新解析。 */
 let traceFile: string | undefined;
-/** 只在配置了 trace 时落盘；写失败静默，诊断不能反过来影响翻译。 */
+/** 写失败静默，诊断不能反过来影响翻译。 */
 function trace(tag: string, data?: Record<string, unknown>): void {
 	if (!traceFile) return;
 	try {
 		appendFileSync(traceFile, JSON.stringify({ t: new Date().toISOString(), pid: process.pid, tag, ...data }) + "\n");
 	} catch {}
+}
+/** 配置为 true 时跟着会话文件走；`--no-session` 这类没有会话文件的进程不落盘。 */
+function resolveTraceFile(config: ResolvedTranslatorConfig, sessionFile: string | undefined): string | undefined {
+	if (config.trace === false) return undefined;
+	if (typeof config.trace === "string") return config.trace;
+	return sessionFile ? sessionFile.replace(/\.jsonl$/, "") + ".thinking-translator-trace.jsonl" : undefined;
 }
 /**
  * 翻译模型不在注册表里时，由扩展自己触发该 provider 的模型发现（宿主只为主模型做这件事；
@@ -87,8 +97,6 @@ let missingModelWarningKey: string | undefined;
 
 /** 译文只附着在可见 thinking 下方，不写入会话或模型上下文。 */
 export default function thinkingTranslator(pi: ExtensionAPI) {
-	// 工厂期还没有 ctx，先按默认路径读一次配置只为拿 trace 开关；正式配置仍在 message_start 加载。
-	traceFile = loadConfig().trace;
 	trace("activate", { cwd: process.cwd() });
 
 	// 身份取宿主真正展示出来的那一行：宿主会折叠代码围栏、丢掉空注释、流式时只揭示前缀，
@@ -255,8 +263,16 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		translationFailureNotified.clear();
 		missingModelWarningKey = undefined;
 	}
-	pi.on("session_start", () => resetTranslations("session_start"));
-	pi.on("session_switch", () => resetTranslations("session_switch"));
+	pi.on("session_start", (_event, ctx) => {
+		resetTranslations("session_start");
+		traceFile = resolveTraceFile(loadConfig(ctx), ctx.sessionManager.getSessionFile());
+		trace("session_start", { sessionFile: ctx.sessionManager.getSessionFile(), cwd: ctx.cwd });
+	});
+	pi.on("session_switch", (_event, ctx) => {
+		resetTranslations("session_switch");
+		traceFile = resolveTraceFile(loadConfig(ctx), ctx.sessionManager.getSessionFile());
+		trace("session_switch", { sessionFile: ctx.sessionManager.getSessionFile(), cwd: ctx.cwd });
+	});
 	pi.on("session_shutdown", () => resetTranslations("session_shutdown"));
 
 	/**
@@ -325,6 +341,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		noteChatContentMounted();
 		// thinking 增量事件太密，配置每条消息只读一次盘；这里直接换成新值，render 永远有键可用。
 		activeConfig = loadConfig(ctx);
+		traceFile = resolveTraceFile(activeConfig, ctx.sessionManager.getSessionFile());
 		messageSeq++;
 		trace("message_start", { messageSeq, hasNotify: typeof ctx.ui?.notify === "function", cwd: ctx.cwd, enabled: activeConfig.enabled, model: activeConfig.translatorModel });
 		// 上一条消息的块原文要留着：它的组件还在被重绘，逐行匹配得拿自己那份原文。
@@ -554,9 +571,7 @@ function getConfigPaths(ctx?: NotifierContext): ConfigPathInfo[] {
 
 /** 详细路径和错误交给 status 命令展示，翻译仅取最终配置。 */
 function loadConfig(ctx?: NotifierContext): ResolvedTranslatorConfig {
-	const config = loadConfigState(ctx).config;
-	traceFile = config.trace;
-	return config;
+	return loadConfigState(ctx).config;
 }
 
 /** 内置默认值不落盘，解析失败则禁用翻译以免误用配置。 */
@@ -588,12 +603,12 @@ function mergeConfig(base: ResolvedTranslatorConfig, value: unknown): ResolvedTr
 	const raw = value as Record<string, unknown>;
 	if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") throw new Error("enabled must be boolean");
 	if (raw.targetLanguage !== undefined && (typeof raw.targetLanguage !== "string" || !raw.targetLanguage.trim())) throw new Error("targetLanguage must be a non-empty string");
-	if (raw.trace !== undefined && raw.trace !== null && typeof raw.trace !== "string") throw new Error("trace must be a file path string");
+	if (raw.trace !== undefined && raw.trace !== null && typeof raw.trace !== "string" && typeof raw.trace !== "boolean") throw new Error("trace must be a path string or boolean");
 	return {
 		enabled: typeof raw.enabled === "boolean" ? raw.enabled : base.enabled,
 		targetLanguage: typeof raw.targetLanguage === "string" ? raw.targetLanguage : base.targetLanguage,
 		translatorModel: normalizeTranslatorModel(raw.translatorModel, base.translatorModel),
-		trace: raw.trace === null ? undefined : typeof raw.trace === "string" && raw.trace.trim() ? raw.trace : base.trace,
+		trace: raw.trace === null ? true : typeof raw.trace === "boolean" ? raw.trace : typeof raw.trace === "string" && raw.trace.trim() ? raw.trace : base.trace,
 	};
 }
 
@@ -684,7 +699,7 @@ async function showConfigStatus(ctx: ExtensionContext): Promise<void> {
 		`targetLanguage: ${state.config.targetLanguage}`,
 		`translatorModel: ${modelRef ? `${modelRef.provider}/${modelRef.id}` : "not configured"}`,
 		`model: ${modelStatus}`,
-		`trace: ${state.config.trace ?? "off"}`,
+		`trace: ${resolveTraceFile(state.config, ctx.sessionManager.getSessionFile()) ?? "off"}`,
 		...state.paths.map((info) => `${info.scope} config: ${info.path} (${info.exists ? "found" : "not found"})`),
 		...state.errors.map((item) => `${item.scope} config error: ${item.error instanceof Error ? item.error.message : String(item.error)}`),
 	];
