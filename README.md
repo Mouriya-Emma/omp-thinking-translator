@@ -2,7 +2,7 @@
 
 An omp extension that translates visible assistant thinking blocks into another language for display only.
 
-It renders one translation box directly below each visible assistant thinking block. If a translation finishes after its box can no longer be repainted, it emits a debounced in-flow transcript row at the current transcript tail. Translations stay in extension memory: they are never written to the session file, never part of the next model request, and never part of compaction input. See [Context Boundary](#context-boundary) for the mechanism, the runtime evidence, and what is explicitly not covered.
+It renders one translation box directly below each visible assistant thinking block. If a translation finishes after its box can no longer be repainted, it emits a debounced in-flow transcript row at the current transcript tail. Translations stay in extension memory: they are never written to the session file, never part of the next model request, and never part of compaction input. See [Context Boundary](#context-boundary) for the mechanism, the runtime evidence, and what is explicitly not covered. The one file the extension does write is a diagnostic trace next to the session file (`trace` option below), which records the extension's own steps and never the session content.
 
 ## Features
 
@@ -17,7 +17,7 @@ It renders one translation box directly below each visible assistant thinking bl
 
 ## Requirements
 
-- omp (`@oh-my-pi/pi-coding-agent`), verified with 18.1.21. The host build must provide `registerAssistantThinkingRenderer`.
+- omp (`@oh-my-pi/pi-coding-agent`), verified with 18.2.0. The host build must provide `registerAssistantThinkingRenderer` and `modelRegistry.refreshDiscoverableProviders`.
 
 This extension is omp-only, not a pi extension. It is built on omp's extension API: the translation box attaches through `pi.registerAssistantThinkingRenderer`, which upstream pi does not provide, and every import resolves against omp's `@oh-my-pi/*` packages rather than pi's own. Running it on pi would mean a different display surface, not a configuration change.
 
@@ -26,7 +26,7 @@ This extension is omp-only, not a pi extension. It is built on omp's extension A
 This extension is installed from git; it is not published to any package registry.
 
 ```bash
-omp install git:github.com/Mouriya-Emma/omp-thinking-translator
+omp plugin install git:github.com/Mouriya-Emma/omp-thinking-translator
 ```
 
 For local development, either load the extension file directly:
@@ -38,17 +38,17 @@ omp -e /absolute/path/to/omp-thinking-translator/extensions/thinking-translator.
 or install from a local checkout:
 
 ```bash
-omp install /absolute/path/to/omp-thinking-translator
+omp plugin install /absolute/path/to/omp-thinking-translator
 ```
 
-The manifest key is `omp.extensions`, and the pinned `@oh-my-pi/*` 18.1.19 packages live in `devDependencies` only: the host already provides them, so installing this extension adds no `@oh-my-pi` packages under the plugin directory.
+The manifest key is `omp.extensions`, and the pinned `@oh-my-pi/*` 18.2.0 packages live in `devDependencies` only: the host already provides them, so installing this extension adds no `@oh-my-pi` packages under the plugin directory.
 
 ## Quick Start
 
 1. Install the extension:
 
    ```bash
-   omp install git:github.com/Mouriya-Emma/omp-thinking-translator
+   omp plugin install git:github.com/Mouriya-Emma/omp-thinking-translator
    ```
 
 2. Create a global config template from inside omp:
@@ -153,10 +153,10 @@ The translation box is presentation output, not conversation content. The canoni
 
 Mechanism:
 
-- Translations live in a module-local `Map` keyed by displayed line text plus translator model and target language (`extensions/thinking-translator.ts:75`), read only by the component returned from `pi.registerAssistantThinkingRenderer` and by the in-flow notify fallback (`extensions/thinking-translator.ts:101-141`, `:165-180`). Those rows flow into the TUI container tree and terminate at the terminal write; on host 18.1.19 no consumer of them reaches a session writer, the provider request builder, or compaction (`assistant-message.ts:841-860` → `pi-tui/src/tui.ts:486-513` → `tui.ts:2735-2781`).
+- Translations live in a module-local `Map` keyed by the raw thinking line plus translator model and target language (`extensions/thinking-translator.ts:104`, `cellKey` `:486`), read only by the component returned from `pi.registerAssistantThinkingRenderer` and by the in-flow notify fallback (`extensions/thinking-translator.ts:130-190`, `:202-235`). Those rows flow into the TUI container tree and terminate at the terminal write; on host 18.1.19 no consumer of them reached a session writer, the provider request builder, or compaction (`assistant-message.ts:841-860` → `pi-tui/src/tui.ts:486-513` → `tui.ts:2735-2781`), and 18.2.0's `#appendThinkingExtensions` (`assistant-message.ts:841-860`) still hands the renderer a fresh context object and only mounts the returned component.
 - The `context.text` handed to the renderer is a resolved display string in a freshly allocated object (`assistant-message.ts:841-852`), not a reference into the stored `AgentMessage`, so a renderer cannot mutate the message through it.
 - Persistence writes typed `SessionEntry.message` values to the session JSONL (`session-manager.ts:2288-2305`, `:817-818`); the next request is rebuilt from those entries (`session-context.ts:216-272`, `agent-loop.ts:1627-1673`); compaction partitions the same branch entries (`compaction.ts:1328-1382`). None of the three reads rendered rows.
-- The hooks that can change model-visible data in this host are `context`, `before_provider_request`, `before_agent_start`, `session_before_compact`, and `session_stop`. The extension registers none of them; its only handlers are session reset, per-message state tracking, chat-content generation, and the thinking-block bookkeeping in `message_start`/`message_update`/`message_end` (`extensions/thinking-translator.ts:210-295`).
+- The hooks that can change model-visible data in this host are `context`, `before_provider_request`, `before_agent_start`, `session_before_compact`, and `session_stop`. The extension registers none of them; its only handlers are session reset, per-message state tracking, chat-content generation, and the thinking-block bookkeeping in `message_start`/`message_update`/`message_end` (`extensions/thinking-translator.ts:266-370`).
 
 The original context-boundary checks below ran on omp 18.1.19, driving the real TUI with a throwaway read-only observer extension attached to `before_provider_request` (the final pre-send payload hook) and `session_before_compact`, using high-entropy fragments of the rendered Chinese plus the box labels `思考翻译` / `等待翻译` / `翻译失败` as canaries. The notify-specific check was repeated on omp 18.1.21 as described below:
 
@@ -176,14 +176,15 @@ Minimal reproduction:
 
 Not covered by this boundary:
 
-- **The translation request itself.** Each eligible thinking line is sent to the configured translator model as its own standalone request (`extensions/thinking-translator.ts:319-363`), separate from the agent conversation. "Not in the agent context" does not mean "not sent to any model": that provider sees your thinking text and retains it under its own policy.
+- **The translation request itself.** Each eligible thinking line is sent to the configured translator model as its own standalone request (`extensions/thinking-translator.ts:403-484`), separate from the agent conversation. "Not in the agent context" does not mean "not sent to any model": that provider sees your thinking text and retains it under its own policy.
 - **Display-derived artifacts.** Terminal scrollback, in-flow notify rows, a terminal recorder, and omp's own `/debug-transcript` (which dumps rendered rows to a temp file, `command-controller.ts:225-236`) contain translated rows by design. That is an observability surface, not conversation context.
 - **Untested paths.** The compaction check ran on a resumed persisted session, so resume is covered to the extent that its canonical messages, provider payloads, and compaction input were inspected — not that historical translations re-render or that every resume UI path was exercised. Session export/import serializers and branch switching were not exercised at all.
-- **Version scope.** The evidence is for this extension revision on omp 18.1.19. The guarantee rests on the host renderer contract and on the request/compaction paths cited above, not on a documented API promise, so re-verify after a host upgrade.
+- **Version scope.** The evidence is for this extension revision on omp 18.1.19 (notify check repeated on 18.1.21). The guarantee rests on the host renderer contract and on the request/compaction paths cited above, not on a documented API promise, so re-verify after a host upgrade; the current pin is 18.2.0 and the code paths were re-read there, but the canary runs were not repeated.
 
 ## Limitations
 
 - If a thinking block is not visible (for example folded away by the host so it never renders), the host never invokes the translation renderer and no box appears for it.
+- Diagnostics: every session-saving process appends `<session file without .jsonl>.thinking-translator-trace.jsonl` beside the session JSONL (see the `trace` option). It contains event names, line counts, the first 40–60 characters of each source line and translation, model ids and file paths — enough to see where a session's translation stopped. Set `trace: false` if that is not acceptable.
 - Terminal scrollback is immutable. The host commits a thinking block's rows once the assistant message reaches its tool call, and after that the box is frozen at whatever it showed — measured: a 998 ms translation landed in the box, a 1567 ms one did not. The in-flow notify row is the fallback for exactly that case, so the translation remains readable at the current transcript tail after whatever tool output already arrived, not directly under its thinking block.
 - Translations exist only in memory: quitting omp or switching sessions discards them, and previously shown messages are not backfilled when a session reopens.
 - Within one session, two identical lines share a single translation as long as the translator model and target language are unchanged.

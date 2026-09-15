@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`omp-thinking-translator` is a single-file [Oh My Pi](https://github.com/oh-my-pi) (omp) extension that renders a translated copy of each visible assistant *thinking* block underneath it in the TUI. Translation is **display-only and memory-only**: it is never written to the session file, model requests, or compaction input. Default target language is Simplified Chinese; the translator model is chosen by config (`{ provider, id }`) and resolved through the host model registry.
+`omp-thinking-translator` is a single-file [Oh My Pi](https://github.com/oh-my-pi) (omp) extension that renders a translated copy of each visible assistant *thinking* block underneath it in the TUI. Translation is **display-only and memory-only**: it is never written to the session file, model requests, or compaction input. The only file the extension writes by default is a diagnostic trace, `<session file without .jsonl>.thinking-translator-trace.jsonl` next to the session JSONL (config `trace: false` disables it; the session file itself is never touched). Default target language is Simplified Chinese; the translator model is chosen by config (`{ provider, id }`) and resolved through the host model registry, with the extension triggering provider discovery itself when the model is absent.
 
 Package is `private` (not published to npm); it is installed into omp directly from git. `CLAUDE.md` holds two hard rules — keep `@oh-my-pi/*` on the latest release, and bump `package.json` `version` in every installable commit — read it before touching deps or committing.
 
@@ -67,7 +67,7 @@ omp plugin list                   # confirm the displayed version matches packag
 
 In-app: `/thinking-translator status | init | init --global | init --project`. `init` writes a **disabled** template (`<agentDir>/thinking-translator.json` or `<cwd>/.omp/thinking-translator.json`) and refuses to overwrite.
 
-Config precedence: defaults < global < project, merged per field (including `translatorModel` subfields). Keys: `enabled` (default `true`), `targetLanguage` (default `"Simplified Chinese"`), `translatorModel: { provider, id }` (required for any translation to happen).
+Config precedence: defaults < global < project, merged per field (including `translatorModel` subfields). Keys: `enabled` (default `true`), `targetLanguage` (default `"Simplified Chinese"`), `translatorModel: { provider, id }` (required for any translation to happen), `trace` (default `true` = sibling of the session file; string = explicit path; `false` = off).
 
 ## Code Conventions & Common Patterns
 
@@ -83,7 +83,7 @@ Config precedence: defaults < global < project, merged per field (including `tra
 ## Important Files
 
 - `extensions/thinking-translator.ts` — entry point declared in `package.json` `omp.extensions`.
-  - `~:9-100` types and module state; `~:101-151` renderer + command registration; `~:153-192` late-row queue/notify; `~:194-304` session/message hooks; `~:325-403` retry + streaming; `~:405-445` cache key and block matching; `~:463-615` config load/validate/init; `~:617-670` prompt and cleanup; `~:672-687` `__testing`.
+  - `~:9-31` types (incl. `trace` in `ResolvedTranslatorConfig`); `~:61-97` constants, `trace()`/`resolveTraceFile`, discovery cooldown; `~:99-201` state + renderer + command registration; `~:202-265` late-row queue/notify/reset; `~:266-400` session/message hooks and `dispatch`; `~:403-484` retry + streaming; `~:486-540` cache key and block matching (`matchBlockLine`, `resolveTrackedLine`); `~:542-735` command, config load/validate/init, model resolution + discovery, status; `~:737-790` prompt and cleanup; `~:791-` `__testing`.
 - `package.json` — scripts, `omp.extensions` manifest, exact `@oh-my-pi/*` pins (`version` field = installed-plugin identity).
 - `pnpm-workspace.yaml` — `allowBuilds: false` for native deps (`esbuild`, `sharp`, `koffi`, `onnxruntime-node`, …) and `minimumReleaseAgeExclude` for `@oh-my-pi/*`; update the version list there when bumping host deps.
 - `tests/thinking-translator.test.ts:4` — direct import of `node_modules/@oh-my-pi/pi-coding-agent/src/utils/thinking-display.ts` (`formatThinkingForDisplay`).
@@ -98,8 +98,8 @@ Config precedence: defaults < global < project, merged per field (including `tra
 
 ## Testing & QA
 
-- Framework: Bun test runner executing `node:test` `test("<sentence>", …)` blocks with `node:assert/strict`; 23 flat tests, no `describe`, no mocks, no shared builders — inline literals only.
-- Coverage: config paths and merge/validation, model normalization, Latin gating, complete-line/streaming block matching, cache key, translation cleanup/splitting, late-row payload building, and the host display-rewrite contract. **Not** covered: extension activation, live model calls, renderer/notify flow, config file I/O.
-- Expectations: any change to a `__testing` helper or the block-matching/late-row rules gets a behavioral test in the same file; lifecycle/renderer changes are verified by running `omp -e …` against a real session and observing the box (`done/total` title) and late `notify` rows. Manual repro steps for the context-exclusion boundary live in `README.md` (~lines 149-174).
+- Framework: Bun test runner executing `node:test` `test("<sentence>", …)` blocks with `node:assert/strict`; 24 flat tests, no `describe`, no mocks, no shared builders — inline literals only.
+- Coverage: config paths and merge/validation, model normalization, Latin gating, complete-line/streaming block matching incl. the reveal-frame-minus-period regression, cache key, translation cleanup/splitting, late-row payload building, and the host display-rewrite contract. **Not** covered: extension activation, live model calls, model discovery fallback, renderer/notify flow, trace output, config file I/O.
+- Expectations: any change to a `__testing` helper or the block-matching/late-row rules gets a behavioral test in the same file; lifecycle/renderer changes are verified by running a session-saving omp against the change and reading the per-session trace file (`session_start → message_start → thinking_end → dispatch → resolve → request → done → settled → render → painted → lateFlush`), plus observing the box (`done/total` title) and late `notify` rows. Fresh processes are not representative of long-lived agentic sessions: model discovery is re-run at startup and hub PTYs do not commit rows to native scrollback, so a change that "works in `/tmp`" must still be confirmed from a real session's trace. Manual repro steps for the context-exclusion boundary live in `README.md` (Context Boundary section).
 - Known limitations to keep in mind when judging "expected" behavior: folded/invisible blocks never render; scrollback freezes at the first tool call (late rows fall back to notify); no backfill on session reopen; identical lines share one translation per model+language; thinking lines are sent to the configured translator model (privacy note in README).
-- Doc drift to be aware of: `README.md` still says `omp install …` (current CLI is `omp plugin install …`) and mentions 18.1.19 pins while `package.json` is on 18.1.21 — trust `package.json` and `CLAUDE.md`.
+- `README.md` is kept in step with the code (install command is `omp plugin install …`, pins match `package.json`); if they disagree, `package.json` and `CLAUDE.md` win and the README is the thing to fix.
