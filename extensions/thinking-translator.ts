@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { stream, type Api, type Model } from "@oh-my-pi/pi-ai";
@@ -23,6 +23,8 @@ type ResolvedTranslatorConfig = {
 	enabled: boolean;
 	targetLanguage: string;
 	translatorModel?: ModelRef;
+	/** 诊断用：设了就把每一步（事件、分发、请求、渲染、迟到通知）以 JSONL 追加到这个文件。 */
+	trace?: string;
 };
 type NotifyLevel = "info" | "warning" | "error";
 type NotifierContext = {
@@ -64,6 +66,15 @@ const LATE_NOTIFY_DEBOUNCE_MS = 400;
 const RETRY_DELAYS_MS = [500, 2000, 6000];
 /** 追踪的 thinking 块上限：更早的块早已提交进历史，译文也已在缓存里。 */
 const MAX_TRACKED_BLOCKS = 32;
+/** 当前生效的 trace 文件；由最近一次加载的配置决定，默认关闭。 */
+let traceFile: string | undefined;
+/** 只在配置了 trace 时落盘；写失败静默，诊断不能反过来影响翻译。 */
+function trace(tag: string, data?: Record<string, unknown>): void {
+	if (!traceFile) return;
+	try {
+		appendFileSync(traceFile, JSON.stringify({ t: new Date().toISOString(), pid: process.pid, tag, ...data }) + "\n");
+	} catch {}
+}
 /**
  * 翻译模型不在注册表里时，由扩展自己触发该 provider 的模型发现（宿主只为主模型做这件事；
  * proxy 发现的模型在缓存过期、静态重载后会从注册表消失）。同一 provider 两次发现之间的最短间隔。
@@ -76,6 +87,10 @@ let missingModelWarningKey: string | undefined;
 
 /** 译文只附着在可见 thinking 下方，不写入会话或模型上下文。 */
 export default function thinkingTranslator(pi: ExtensionAPI) {
+	// 工厂期还没有 ctx，先按默认路径读一次配置只为拿 trace 开关；正式配置仍在 message_start 加载。
+	traceFile = loadConfig().trace;
+	trace("activate", { cwd: process.cwd() });
+
 	// 身份取宿主真正展示出来的那一行：宿主会折叠代码围栏、丢掉空注释、流式时只揭示前缀，
 	// 拿 thinking 事件里的原始文本当键，总有展示行查不到自己的译文格。
 	const translations = new Map<string, TranslationCell>();
@@ -109,6 +124,9 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		const sources = splitTranslationLines(context.text);
 		const blockLabel = `第 ${context.thinkingIndex + 1} 块`;
 		requestRender = context.requestRender;
+		trace("factory", { thinkingIndex: context.thinkingIndex, contentIndex: context.contentIndex, textLen: context.text.length, sources: sources.length, liveBlocks: liveBlocks.size, hasCtx: latestContext !== undefined, hasConfig: activeConfig !== undefined });
+		// render 每帧都来；只在格状态签名变化时记一条，否则 trace 文件会被重绘刷爆。
+		let lastRenderSig = "";
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		const title = new Text("", 0, 0);
 		const body = new Markdown("", 0, 0, getMarkdownTheme());
@@ -118,12 +136,21 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			render(width: number): readonly string[] {
 				dispatch(sources, context.requestRender, blockLabel);
 				const config = activeConfig;
-				if (!config) return [];
+				if (!config) {
+					if (lastRenderSig !== "no-config") trace("render", { thinkingIndex: context.thinkingIndex, reason: "no-config" });
+					lastRenderSig = "no-config";
+					return [];
+				}
 				const cells: TranslationCell[] = [];
 				for (const source of sources) {
 					// 揭示中的展示变体（缺句号、省略号收尾）都指向同一格；对不上追踪块的历史行按展示文本查。
 					const cell = translations.get(cellKey(config, resolveTrackedLine(liveBlocks.values(), source) ?? source));
 					if (cell) cells.push(cell);
+				}
+				const sig = cells.map((cell) => `${cell.progress.status}${cell.painted ? "*" : ""}`).join(",");
+				if (sig !== lastRenderSig) {
+					lastRenderSig = sig;
+					trace("render", { thinkingIndex: context.thinkingIndex, sources: sources.length, cells: sig, width });
 				}
 				if (cells.length === 0) return [];
 				let completed = 0;
@@ -134,7 +161,10 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 					if (text === undefined) continue;
 					rows.push(text);
 					// 有正文画出去，框里就看得见译文；真正需要兜底的是一个字都没画上的格。
-					if (cell.progress.status === "done") cell.painted = true;
+					if (cell.progress.status === "done" && !cell.painted) {
+						cell.painted = true;
+						trace("painted", { thinkingIndex: context.thinkingIndex, text: text.slice(0, 40) });
+					}
 				}
 				// 还没有任何译文时不占版面：等待中的行只计入标题的计数。
 				if (rows.length === 0) return [];
@@ -173,6 +203,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	function flushLateNotifications(): void {
 		const ctx = latestContext;
 		if (!ctx?.ui?.notify) {
+			trace("lateFlush", { dropped: lateQueue.length, reason: "no-notify-ctx" });
 			lateQueue.length = 0;
 			return;
 		}
@@ -181,6 +212,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			lastLatePayload,
 			lastLatePayload !== undefined && lastLateNotifyGeneration === chatContentGeneration,
 		);
+		trace("lateFlush", { queued: lateQueue.length, painted: lateQueue.filter(({ cell }) => cell.painted).length, rows: payload?.rows.length ?? 0, generation: chatContentGeneration });
 		lateQueue.length = 0;
 		if (!payload) return;
 		ctx.ui.notify(payload.text, "info");
@@ -209,7 +241,8 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	}
 
 	/** 切换会话时中止旧请求并丢弃译文缓存。 */
-	function resetTranslations(): void {
+	function resetTranslations(reason: string): void {
+		trace("reset", { reason, cells: translations.size, liveBlocks: liveBlocks.size, queued: lateQueue.length });
 		controller.abort();
 		controller = new AbortController();
 		translations.clear();
@@ -222,9 +255,9 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		translationFailureNotified.clear();
 		missingModelWarningKey = undefined;
 	}
-	pi.on("session_start", resetTranslations);
-	pi.on("session_switch", resetTranslations);
-	pi.on("session_shutdown", resetTranslations);
+	pi.on("session_start", () => resetTranslations("session_start"));
+	pi.on("session_switch", () => resetTranslations("session_switch"));
+	pi.on("session_shutdown", () => resetTranslations("session_shutdown"));
 
 	/**
 	 * 分发点在渲染期：只有这里知道宿主最终展示了哪些行。
@@ -247,6 +280,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			if (canonical !== undefined && !translations.has(cellKey(config, canonical))) missing.push(canonical);
 		}
 		if (missing.length === 0) return;
+		trace("dispatch", { blockLabel, sources: sources.length, missing: missing.length });
 		const signal = controller.signal;
 		// 先占格：模型解析可能要等一次网络发现，期间的重绘不能再为同一行发起分发。
 		const pending: [string, TranslationCell][] = [];
@@ -259,6 +293,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			pending.push([line, cell]);
 		}
 		void resolveTranslatorModel(ctx, config).then((model) => {
+			trace("resolve", { blockLabel, found: model !== undefined, aborted: signal.aborted, pending: pending.length });
 			if (signal.aborted) return;
 			if (!model) {
 				// 撤回占位：注册表里暂时没有这个模型，让之后的重绘在冷却期后再试，而不是永久跳过。
@@ -279,6 +314,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	 * 快照过滤掉，避免已经画进框的译文再次出现。
 	 */
 	function noteTranslationSettled(cell: TranslationCell, blockLabel: string, signal: AbortSignal): void {
+		trace("settled", { blockLabel, status: cell.progress.status, painted: cell.painted, aborted: signal.aborted });
 		if (signal.aborted || cell.progress.status !== "done" || !cell.progress.translation || cell.painted) return;
 		lateQueue.push({ blockLabel, text: cell.progress.translation, cell });
 		scheduleLateNotify();
@@ -290,6 +326,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		// thinking 增量事件太密，配置每条消息只读一次盘；这里直接换成新值，render 永远有键可用。
 		activeConfig = loadConfig(ctx);
 		messageSeq++;
+		trace("message_start", { messageSeq, hasNotify: typeof ctx.ui?.notify === "function", cwd: ctx.cwd, enabled: activeConfig.enabled, model: activeConfig.translatorModel });
 		// 上一条消息的块原文要留着：它的组件还在被重绘，逐行匹配得拿自己那份原文。
 		for (const key of liveBlocks.keys()) {
 			if (liveBlocks.size <= MAX_TRACKED_BLOCKS) break;
@@ -312,6 +349,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		}
 		if (blockEvent.type !== "thinking_end") return;
 		liveBlocks.set(blockKey(messageSeq, blockEvent.contentIndex), { raw: blockEvent.content, ended: true });
+		trace("thinking_end", { messageSeq, contentIndex: blockEvent.contentIndex, rawLen: blockEvent.content.length, hasRequestRender: requestRender !== undefined });
 		// 末行此刻才定型，催一次重绘让它进入分发。
 		requestRender?.();
 	});
@@ -321,6 +359,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	pi.on("message_end", (_event, ctx) => {
 		latestContext = ctx;
 		for (const live of liveBlocks.values()) live.ended = true;
+		trace("message_end", { messageSeq, liveBlocks: liveBlocks.size, cells: translations.size, queued: lateQueue.length });
 		requestRender?.();
 	});
 }
@@ -363,6 +402,7 @@ async function translateLine(
 			// 翻译模型不在线、限流、连接中断都是可恢复的：退避重试，中途保持"等待"而不是先报错。
 			if (attempt + 1 < RETRY_DELAYS_MS.length + 1 && (await sleepUnlessAborted(RETRY_DELAYS_MS[attempt]!, signal))) continue;
 			if (signal.aborted) return;
+			trace("translateError", { message, attempts: attempt + 1 });
 			cell.progress = { status: "error", error: message };
 			requestRender();
 			notifyTranslationFailure(ctx, error);
@@ -400,6 +440,7 @@ async function streamTranslation(
 	const auth = await getTranslatorAuth(ctx, translatorModel);
 	if (signal.aborted) return;
 	const prompt = buildTranslationPrompt(source, config.targetLanguage);
+	trace("request", { source: source.slice(0, 60), model: `${translatorModel.provider}/${translatorModel.id}`, hasKey: auth.apiKey !== undefined });
 	const eventStream = stream(
 		translatorModel,
 		{ messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
@@ -419,6 +460,7 @@ async function streamTranslation(
 	// 空响应按失败处理：重试一次往往就有内容，直接落空格只会留下一行空白。
 	const cleaned = cleanTranslation(translation);
 	if (!cleaned) throw new Error("translator returned empty text");
+	trace("done", { source: source.slice(0, 40), translation: cleaned.slice(0, 40) });
 	cell.progress = { status: "done", translation: cleaned };
 	requestRender();
 }
@@ -512,7 +554,9 @@ function getConfigPaths(ctx?: NotifierContext): ConfigPathInfo[] {
 
 /** 详细路径和错误交给 status 命令展示，翻译仅取最终配置。 */
 function loadConfig(ctx?: NotifierContext): ResolvedTranslatorConfig {
-	return loadConfigState(ctx).config;
+	const config = loadConfigState(ctx).config;
+	traceFile = config.trace;
+	return config;
 }
 
 /** 内置默认值不落盘，解析失败则禁用翻译以免误用配置。 */
@@ -544,10 +588,12 @@ function mergeConfig(base: ResolvedTranslatorConfig, value: unknown): ResolvedTr
 	const raw = value as Record<string, unknown>;
 	if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") throw new Error("enabled must be boolean");
 	if (raw.targetLanguage !== undefined && (typeof raw.targetLanguage !== "string" || !raw.targetLanguage.trim())) throw new Error("targetLanguage must be a non-empty string");
+	if (raw.trace !== undefined && raw.trace !== null && typeof raw.trace !== "string") throw new Error("trace must be a file path string");
 	return {
 		enabled: typeof raw.enabled === "boolean" ? raw.enabled : base.enabled,
 		targetLanguage: typeof raw.targetLanguage === "string" ? raw.targetLanguage : base.targetLanguage,
 		translatorModel: normalizeTranslatorModel(raw.translatorModel, base.translatorModel),
+		trace: raw.trace === null ? undefined : typeof raw.trace === "string" && raw.trace.trim() ? raw.trace : base.trace,
 	};
 }
 
@@ -608,6 +654,7 @@ async function discoverTranslatorModel(ctx: ExtensionContext, modelRef: ModelRef
 function notifyMissingModel(ctx: NotifierContext, key: string, message: string): void {
 	if (missingModelWarningKey === key) return;
 	missingModelWarningKey = key;
+	trace("missingModel", { key });
 	ctx.ui?.notify?.(message, "warning");
 }
 
@@ -637,6 +684,7 @@ async function showConfigStatus(ctx: ExtensionContext): Promise<void> {
 		`targetLanguage: ${state.config.targetLanguage}`,
 		`translatorModel: ${modelRef ? `${modelRef.provider}/${modelRef.id}` : "not configured"}`,
 		`model: ${modelStatus}`,
+		`trace: ${state.config.trace ?? "off"}`,
 		...state.paths.map((info) => `${info.scope} config: ${info.path} (${info.exists ? "found" : "not found"})`),
 		...state.errors.map((item) => `${item.scope} config error: ${item.error instanceof Error ? item.error.message : String(item.error)}`),
 	];
