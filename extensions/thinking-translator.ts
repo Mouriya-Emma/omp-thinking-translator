@@ -64,6 +64,12 @@ const LATE_NOTIFY_DEBOUNCE_MS = 400;
 const RETRY_DELAYS_MS = [500, 2000, 6000];
 /** 追踪的 thinking 块上限：更早的块早已提交进历史，译文也已在缓存里。 */
 const MAX_TRACKED_BLOCKS = 32;
+/**
+ * 翻译模型不在注册表里时，由扩展自己触发该 provider 的模型发现（宿主只为主模型做这件事；
+ * proxy 发现的模型在缓存过期、静态重载后会从注册表消失）。同一 provider 两次发现之间的最短间隔。
+ */
+const MODEL_DISCOVERY_COOLDOWN_MS = 60_000;
+const lastModelDiscoveryAt = new Map<string, number>();
 const configErrorNotified = new Set<string>();
 const translationFailureNotified = new Set<string>();
 let missingModelWarningKey: string | undefined;
@@ -234,17 +240,30 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		if (!config.enabled) return;
 		const missing = sources.filter((line) => shouldTranslateLine(line) && isTrackedBlockLine(line) && !translations.has(cellKey(config, line)));
 		if (missing.length === 0) return;
-		const model = resolveTranslatorModel(ctx, config);
-		if (!model) return;
+		const signal = controller.signal;
+		// 先占格：模型解析可能要等一次网络发现，期间的重绘不能再为同一行发起分发。
+		const pending: [string, TranslationCell][] = [];
 		for (const line of missing) {
-			const signal = controller.signal;
 			const key = cellKey(config, line);
 			// 同一次分发里的重复行共用一格。
 			if (translations.has(key)) continue;
 			const cell: TranslationCell = { progress: { status: "pending" }, painted: false };
 			translations.set(key, cell);
-			void translateLine(cell, line, ctx, config, model, signal, notify).then(() => noteTranslationSettled(cell, blockLabel, signal));
+			pending.push([line, cell]);
 		}
+		void resolveTranslatorModel(ctx, config).then((model) => {
+			if (signal.aborted) return;
+			if (!model) {
+				// 撤回占位：注册表里暂时没有这个模型，让之后的重绘在冷却期后再试，而不是永久跳过。
+				for (const [line, cell] of pending) {
+					if (translations.get(cellKey(config, line)) === cell) translations.delete(cellKey(config, line));
+				}
+				return;
+			}
+			for (const [line, cell] of pending) {
+				void translateLine(cell, line, ctx, config, model, signal, notify).then(() => noteTranslationSettled(cell, blockLabel, signal));
+			}
+		});
 	}
 
 	/** 这一行是否属于任一在追踪的块。 */
@@ -457,7 +476,7 @@ async function handleConfigCommand(args: string, ctx: ExtensionContext): Promise
 		initConfigFile(ctx, scope);
 		return;
 	}
-	showConfigStatus(ctx);
+	await showConfigStatus(ctx);
 }
 
 /** 项目配置允许覆盖全局翻译策略。 */
@@ -539,20 +558,39 @@ function notifyConfigLoadError(ctx: NotifierContext | undefined, path: string, e
 	ctx?.ui?.notify?.(`thinking-translator config invalid, translation disabled: ${path}: ${message}`, "warning");
 }
 
-/** 找不到翻译模型时只警告并跳过，不影响主对话。 */
-function resolveTranslatorModel(ctx: ExtensionContext, config: ResolvedTranslatorConfig): Model<Api> | undefined {
+/**
+ * 找不到翻译模型时先让宿主发现一次该 provider 的模型再查；仍找不到只警告并跳过，不影响主对话。
+ * 宿主的注册表只为当前主模型恢复 discovery 结果，翻译模型所在的 proxy provider 没人负责：
+ * 缓存过期或静态重载后它的模型会整体从 `find` 里消失，长会话里因此"曾经能翻，后来不翻"。
+ */
+async function resolveTranslatorModel(ctx: ExtensionContext, config: ResolvedTranslatorConfig): Promise<Model<Api> | undefined> {
 	const modelRef = config.translatorModel;
 	if (!modelRef) {
 		notifyMissingModel(ctx, "not-configured", "thinking-translator enabled but translatorModel is not configured; translation skipped");
 		return undefined;
 	}
-	const model = ctx.modelRegistry.find(modelRef.provider, modelRef.id);
+	const model = ctx.modelRegistry.find(modelRef.provider, modelRef.id) ?? (await discoverTranslatorModel(ctx, modelRef));
 	if (!model) {
-		notifyMissingModel(ctx, `${modelRef.provider}/${modelRef.id}`, `thinking-translator model not found: ${modelRef.provider}/${modelRef.id}; translation skipped`);
+		notifyMissingModel(
+			ctx,
+			`${modelRef.provider}/${modelRef.id}`,
+			`thinking-translator model not found: ${modelRef.provider}/${modelRef.id}; translation skipped, will retry discovery in ${MODEL_DISCOVERY_COOLDOWN_MS / 1000}s`,
+		);
 		return undefined;
 	}
 	missingModelWarningKey = undefined;
 	return model;
+}
+
+/** 触发一次在线发现并重查；冷却期内直接返回未命中，避免每次重绘都打网络。 */
+async function discoverTranslatorModel(ctx: ExtensionContext, modelRef: ModelRef): Promise<Model<Api> | undefined> {
+	const now = Date.now();
+	const last = lastModelDiscoveryAt.get(modelRef.provider);
+	if (last !== undefined && now - last < MODEL_DISCOVERY_COOLDOWN_MS) return undefined;
+	lastModelDiscoveryAt.set(modelRef.provider, now);
+	// 发现失败（网络、鉴权）由宿主记进它自己的 discovery 状态；这里只关心之后能不能查到。
+	await ctx.modelRegistry.refreshDiscoverableProviders([modelRef.provider], "online").catch(() => undefined);
+	return ctx.modelRegistry.find(modelRef.provider, modelRef.id);
 }
 
 /** 同一种模型缺失问题只提示一次。 */
@@ -570,11 +608,18 @@ function notifyTranslationFailure(ctx: NotifierContext, error: unknown): void {
 	ctx.ui?.notify?.("thinking translation failed: " + message, "warning");
 }
 
-/** 展示配置来源和模型可用性，帮助用户判断需要修改哪个 JSON。 */
-function showConfigStatus(ctx: ExtensionContext): void {
+/** 展示配置来源和模型可用性，帮助用户判断需要修改哪个 JSON；模型不在注册表时先强制发现一次再报。 */
+async function showConfigStatus(ctx: ExtensionContext): Promise<void> {
 	const state = loadConfigState(ctx);
 	const modelRef = state.config.translatorModel;
-	const modelStatus = modelRef ? (ctx.modelRegistry.find(modelRef.provider, modelRef.id) ? "available" : "not found") : "not configured";
+	let modelStatus = "not configured";
+	if (modelRef) {
+		if (ctx.modelRegistry.find(modelRef.provider, modelRef.id)) modelStatus = "available";
+		else {
+			lastModelDiscoveryAt.delete(modelRef.provider);
+			modelStatus = (await discoverTranslatorModel(ctx, modelRef)) ? "available (after discovery)" : "not found (after discovery)";
+		}
+	}
 	const lines = [
 		"thinking-translator status",
 		`enabled: ${state.config.enabled}`,

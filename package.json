@@ -1,6 +1,6 @@
 {
   "name": "omp-thinking-translator",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "omp extension for translating visible assistant thinking blocks.",
   "type": "module",
   "license": "MIT",
@@ -34,9 +34,9 @@
     ]
   },
   "devDependencies": {
-    "@oh-my-pi/pi-ai": "18.1.21",
-    "@oh-my-pi/pi-coding-agent": "18.1.21",
-    "@oh-my-pi/pi-tui": "18.1.21",
+    "@oh-my-pi/pi-ai": "18.2.0",
+    "@oh-my-pi/pi-coding-agent": "18.2.0",
+    "@oh-my-pi/pi-tui": "18.2.0",
     "@types/node": "^24.3.0",
     "typescript": "^5.7.3"
   }
