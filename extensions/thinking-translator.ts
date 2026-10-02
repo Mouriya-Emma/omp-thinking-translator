@@ -4,7 +4,8 @@ import { dirname, join } from "node:path";
 import { stream, type Api, type Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getMarkdownTheme } from "@oh-my-pi/pi-coding-agent";
-import { Box, Markdown, Text } from "@oh-my-pi/pi-tui";
+import { Box, Markdown, Text, node, span } from "@oh-my-pi/pi-tui";
+import type { Component, DescribeContext, NativeEventTarget, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
 
 type ModelRef = { provider: string; id: string };
 type TranslationProgress =
@@ -19,6 +20,8 @@ type TranslationProgress =
 type TranslationCell = { progress: TranslationProgress; painted: boolean };
 /** 一个 thinking 块的原文与收尾状态；收尾后末行才定型，可以进入分发。 */
 type LiveBlock = { raw: string; ended: boolean };
+/** 一个 thinking 块当前可画的译文：已结束的格数、总格数和有正文的行。 */
+type TranslationView = { completed: number; total: number; rows: string[] };
 type ResolvedTranslatorConfig = {
 	enabled: boolean;
 	targetLanguage: string;
@@ -123,6 +126,12 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	let lastLateNotifyGeneration: number | undefined;
 	let messageSeq = 0;
 	/**
+	 * 组件被原生后端调用过 `describe` 就说明 Tern Surface Protocol 正在渲染：
+	 * 原生 surface 没有 append-only scrollback，译文总会画进 section，不需要 late notify 兜底。
+	 * 不用 pi-tui 的 `isNativeRendering()`：它是模块级状态，扩展与宿主解析到不同副本时永远读到 false。
+	 */
+	let nativeSeen = false;
+	/**
 	 * `showStatus` 按上一次 notify 创建的 spacer+Text 做身份合并：两次通知之间若没有宿主消息事件，
 	 * 后一次会覆盖上一行，所以必须连同上一份完整 payload 一起重发；message_start、message_update、
 	 * message_end 每次都递增 generation，表示 chat 子节点已挂载或变更，之后必须从新 payload 开始。
@@ -133,57 +142,104 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		const blockLabel = `第 ${context.thinkingIndex + 1} 块`;
 		requestRender = context.requestRender;
 		trace("factory", { thinkingIndex: context.thinkingIndex, contentIndex: context.contentIndex, textLen: context.text.length, sources: sources.length, liveBlocks: liveBlocks.size, hasCtx: latestContext !== undefined, hasConfig: activeConfig !== undefined });
-		// render 每帧都来；只在格状态签名变化时记一条，否则 trace 文件会被重绘刷爆。
+		// 每帧都来；只在格状态签名变化时记一条，否则 trace 文件会被重绘刷爆。
 		let lastRenderSig = "";
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		const title = new Text("", 0, 0);
 		const body = new Markdown("", 0, 0, getMarkdownTheme());
 		box.addChild(title);
 		box.addChild(body);
-		return {
+		const heading = (view: TranslationView): string => `思考翻译 · 块 ${context.thinkingIndex + 1} · ${view.completed}/${view.total}`;
+		/** ANSI 行与原生描述共用：分发、取格、标记 painted；没有可画的正文时返回 undefined。 */
+		const collect = (width: number | undefined): TranslationView | undefined => {
+			dispatch(sources, context.requestRender, blockLabel);
+			const config = activeConfig;
+			if (!config) {
+				if (lastRenderSig !== "no-config") trace("render", { thinkingIndex: context.thinkingIndex, reason: "no-config" });
+				lastRenderSig = "no-config";
+				return undefined;
+			}
+			const cells: TranslationCell[] = [];
+			for (const source of sources) {
+				// 揭示中的展示变体（缺句号、省略号收尾）都指向同一格；对不上追踪块的历史行按展示文本查。
+				const cell = translations.get(cellKey(config, resolveTrackedLine(liveBlocks.values(), source) ?? source));
+				if (cell) cells.push(cell);
+			}
+			const sig = cells.map((cell) => `${cell.progress.status}${cell.painted ? "*" : ""}`).join(",");
+			if (sig !== lastRenderSig) {
+				lastRenderSig = sig;
+				trace("render", { thinkingIndex: context.thinkingIndex, sources: sources.length, cells: sig, width, native: nativeSeen });
+			}
+			if (cells.length === 0) return undefined;
+			let completed = 0;
+			const rows: string[] = [];
+			for (const cell of cells) {
+				if (cell.progress.status === "done" || cell.progress.status === "error") completed++;
+				const text = cellBody(cell);
+				if (text === undefined) continue;
+				rows.push(text);
+				// 有正文画出去，框里就看得见译文；真正需要兜底的是一个字都没画上的格。
+				if (cell.progress.status === "done" && !cell.painted) {
+					cell.painted = true;
+					trace("painted", { thinkingIndex: context.thinkingIndex, text: text.slice(0, 40), native: nativeSeen });
+				}
+			}
+			// 还没有任何译文时不占版面：等待中的行只计入标题的计数。
+			if (rows.length === 0) return undefined;
+			return { completed, total: cells.length, rows };
+		};
+		// 用户在 Tern 里折叠/展开的结果；没操作过就跟随进度：翻译中展开，译完折叠，与宿主 thinking 一致。
+		let userCollapsed: boolean | undefined;
+		// 内容没变就返回同一个节点对象，后端据此跳过这一块的 diff。
+		let lastNode: NativeNode | null = null;
+		let lastNodeSig = "";
+		const component: Component & NativeEventTarget = {
 			render(width: number): readonly string[] {
-				dispatch(sources, context.requestRender, blockLabel);
-				const config = activeConfig;
-				if (!config) {
-					if (lastRenderSig !== "no-config") trace("render", { thinkingIndex: context.thinkingIndex, reason: "no-config" });
-					lastRenderSig = "no-config";
-					return [];
-				}
-				const cells: TranslationCell[] = [];
-				for (const source of sources) {
-					// 揭示中的展示变体（缺句号、省略号收尾）都指向同一格；对不上追踪块的历史行按展示文本查。
-					const cell = translations.get(cellKey(config, resolveTrackedLine(liveBlocks.values(), source) ?? source));
-					if (cell) cells.push(cell);
-				}
-				const sig = cells.map((cell) => `${cell.progress.status}${cell.painted ? "*" : ""}`).join(",");
-				if (sig !== lastRenderSig) {
-					lastRenderSig = sig;
-					trace("render", { thinkingIndex: context.thinkingIndex, sources: sources.length, cells: sig, width });
-				}
-				if (cells.length === 0) return [];
-				let completed = 0;
-				const rows: string[] = [];
-				for (const cell of cells) {
-					if (cell.progress.status === "done" || cell.progress.status === "error") completed++;
-					const text = cellBody(cell);
-					if (text === undefined) continue;
-					rows.push(text);
-					// 有正文画出去，框里就看得见译文；真正需要兜底的是一个字都没画上的格。
-					if (cell.progress.status === "done" && !cell.painted) {
-						cell.painted = true;
-						trace("painted", { thinkingIndex: context.thinkingIndex, text: text.slice(0, 40) });
-					}
-				}
-				// 还没有任何译文时不占版面：等待中的行只计入标题的计数。
-				if (rows.length === 0) return [];
-				title.setText(theme.fg("accent", `思考翻译 · 块 ${context.thinkingIndex + 1} · ${completed}/${cells.length}`));
-				body.setText(rows.join("\n\n"));
+				const view = collect(width);
+				if (!view) return [];
+				title.setText(theme.fg("accent", heading(view)));
+				body.setText(view.rows.join("\n\n"));
 				return box.render(width);
+			},
+			// Tern Surface Protocol：与宿主 thinking 同构的 section（role omp.thinking*），ANSI 终端不会走到这里。
+			describe(cx: DescribeContext): NativeNode | null {
+				nativeSeen = true;
+				if (!cx.supports("section") || !cx.supports("md")) return null;
+				const view = collect(undefined);
+				if (!view) {
+					lastNode = null;
+					lastNodeSig = "";
+					return null;
+				}
+				const live = view.completed < view.total;
+				const collapsed = userCollapsed ?? !live;
+				const text = view.rows.join("\n\n");
+				const nodeSig = `${live ? "L" : "D"}${collapsed ? "C" : "O"}|${heading(view)}|${text}`;
+				if (lastNode && nodeSig === lastNodeSig) return lastNode;
+				const label = heading(view);
+				// 与宿主一致：翻译中是 starburst 加标题，译完是静态一行。
+				const head = live
+					? node("row", { gap: "sm" }, [node("spinner", { style: "starburst", role: "omp.thinking.spin" }), node("text", { spans: [span(label, "muted")] })], "head")
+					: node("text", { spans: [span(label, "muted")] }, undefined, "head");
+				lastNode = node(
+					"section",
+					{ role: live ? "omp.thinking.live" : "omp.thinking", collapsible: true, collapsed },
+					[head, node("md", live ? { text, stream: true } : { text }, undefined, "body")],
+				);
+				lastNodeSig = nodeSig;
+				return lastNode;
+			},
+			handleNativeEvent(event: NativeUiEvent): void {
+				// 根节点（section 本身）的折叠开关；key 为空串。
+				if (event.type !== "toggle" || event.key !== "") return;
+				userCollapsed = event.collapsed;
+				context.requestRender();
 			},
 			invalidate(): void {
 				box.invalidate();
 			},
 		};
+		return component;
 	});
 
 	pi.registerCommand("thinking-translator", {
@@ -331,7 +387,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 	 */
 	function noteTranslationSettled(cell: TranslationCell, blockLabel: string, signal: AbortSignal): void {
 		trace("settled", { blockLabel, status: cell.progress.status, painted: cell.painted, aborted: signal.aborted });
-		if (signal.aborted || cell.progress.status !== "done" || !cell.progress.translation || cell.painted) return;
+		if (signal.aborted || nativeSeen || cell.progress.status !== "done" || !cell.progress.translation || cell.painted) return;
 		lateQueue.push({ blockLabel, text: cell.progress.translation, cell });
 		scheduleLateNotify();
 	}
