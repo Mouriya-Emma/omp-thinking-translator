@@ -4,7 +4,7 @@
 
 `omp-thinking-translator` is a single-file [Oh My Pi](https://github.com/oh-my-pi) (omp) extension that renders a translated copy of each visible assistant *thinking* block underneath it in the TUI. Translation is **display-only and memory-only**: it is never written to the session file, model requests, or compaction input. The only file the extension writes by default is a diagnostic trace, `<session file without .jsonl>.thinking-translator-trace.jsonl` next to the session JSONL (config `trace: false` disables it; the session file itself is never touched). Default target language is Simplified Chinese; the translator models are an ordered fallback chain chosen by config (`translatorModels: [{ provider, id, effort? }, …]`), each resolved through the host model registry at request time, with the extension triggering provider discovery itself when a model is absent.
 
-Package is `private` (not published to npm); it is installed into omp directly from git. `CLAUDE.md` holds two hard rules — keep `@oh-my-pi/*` on the latest release, and bump `package.json` `version` in every installable commit — read it before touching deps or committing.
+Package is `private` (not published to npm); it is installed into omp directly from git. `CLAUDE.md` holds two hard rules — keep `@oh-my-pi/*` on the latest release, and the version policy (CI bumps the patch on every push to `main`; minor bumps are set by hand) — read it before touching deps or committing.
 
 ## Architecture & Data Flow
 
@@ -63,7 +63,7 @@ bun test tests/thinking-translator.test.ts -t "config paths"   # single test by 
 # Run against a live omp without installing
 omp -e /absolute/path/to/extensions/thinking-translator.ts
 
-# Install / refresh the plugin (bump package.json version first — see CLAUDE.md)
+# Install / refresh the plugin after the bump-version run on main finishes (see CLAUDE.md)
 omp plugin install git:github.com/Mouriya-Emma/omp-thinking-translator
 omp plugin list                   # confirm the displayed version matches package.json
 ```
@@ -96,8 +96,8 @@ Config precedence: defaults < global < project, merged per field; `translatorMod
 - **Runtime target is the user's installed omp** (Bun-based). Tests run under `bun test` using the `node:test`/`node:assert/strict` API. Typecheck uses `tsc` with `--moduleResolution bundler --module esnext --target es2024 --types node`; Node built-ins (`fs`, `os`, `path`) are used, no Bun-only APIs in the extension.
 - **Package manager: pnpm** (`pnpm-lock.yaml` v9). Do not introduce `package-lock.json`/`bun.lockb`.
 - **`@oh-my-pi/*` devDependencies must be exact and aligned to `dist-tags.latest`** (`CLAUDE.md`). If `pnpm check` fails after a bump because the host changed `formatThinkingForDisplay`, adapt the extension — never pin back.
-- No CI (`.github/` absent); `pnpm check` is the only gate. No formatter; do not add one as part of unrelated work.
-- Every commit that changes installable behavior must bump `package.json` `version` (minor for visible behavior, patch for fixes) and then be verified with `omp plugin install` + `omp plugin list`.
+- The only CI is `.github/workflows/bump-version.yml`, which bumps the version on every push to `main` and runs no checks; `pnpm check` remains the only gate. No formatter; do not add one as part of unrelated work.
+- Every push to `main` gets a new patch version from CI. A commit that changes visible behavior sets the next minor (`0.(Y+1).0`) by hand before pushing, and CI turns it into `0.(Y+1).1`. Verify with `omp plugin install` + `omp plugin list` after that run.
 
 ## Testing & QA
 
