@@ -101,6 +101,13 @@ test("shouldTranslateLine accepts foreign lines of any length and rejects the re
 	assert.equal(__testing.shouldTranslateLine(""), false);
 });
 
+test("shouldTranslateLine ignores inline code when classifying Chinese prose", () => {
+	const chineseWithIdentifiers =
+		"还有一点：展示文本每次变化都会重建渲染组件，导致 `userCollapsed` 也被重置，核心修复是让默认折叠状态跟随 `expandThinkingBlocks`（`collapsed = userCollapsed ?? (!live && !expand)`）。接下来我会查扩展 API 能否读取该设置，并检查 `CLAUDE.md`、`AGENTS.md` 中的仓库约束。";
+	assert.equal(__testing.shouldTranslateLine(chineseWithIdentifiers), false);
+	assert.equal(__testing.shouldTranslateLine("Call `registerAssistantThinkingRenderer` after checking the API."), true);
+});
+
 test("matchBlockLine returns the raw line for host rewrites and rejects reveal prefixes", () => {
 	const raw = "Check the parser first.\n```ts\nconst x = 1;\n```\nThen run the tests.";
 	assert.equal(__testing.matchBlockLine(raw, "Check the parser first."), "Check the parser first.");
@@ -204,6 +211,17 @@ test("cleanTranslation preserves normal internal text", () => {
 	assert.equal(__testing.cleanTranslation("hello   world"), "hello   world");
 	assert.equal(__testing.cleanTranslation("first line\nsecond   line"), "first line\nsecond   line");
 	assert.equal(__testing.cleanTranslation("  hello   world  "), "hello   world");
+});
+
+test("SOURCE_TEXT_BEGIN aborts the current model attempt so fallback can continue", () => {
+	const controller = new AbortController();
+	__testing.abortOnSourceTextBegin("SOURCE_TEXT_BEGI", controller);
+	assert.equal(controller.signal.aborted, false);
+	assert.throws(
+		() => __testing.abortOnSourceTextBegin("SOURCE_TEXT_BEGIN\nEchoed source text", controller),
+		/translator returned SOURCE_TEXT_BEGIN/,
+	);
+	assert.equal(controller.signal.aborted, true);
 });
 
 test("line requests preserve order and duplicates while omitting non-Latin lines", () => {
