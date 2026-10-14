@@ -1,6 +1,6 @@
 {
   "name": "omp-thinking-translator",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "omp extension for translating visible assistant thinking blocks.",
   "type": "module",
   "license": "MIT",
