@@ -45,7 +45,7 @@ Host APIs relied on: `api.registerAssistantThinkingRenderer`, `api.registerComma
 | --- | --- |
 | `extensions/thinking-translator.ts` | The whole extension: state, renderer, dispatch, streaming, config, `/thinking-translator` command, `__testing` exports |
 | `tests/thinking-translator.test.ts` | Unit tests over `__testing` pure helpers + one host contract test |
-| `README.md` | User docs: install, config keys, pipeline, boundary evidence, limitations |
+| `README.md`, `README.zh-CN.md` | User docs in English (default) and Simplified Chinese, same content: install, config keys, pipeline, boundary evidence, limitations |
 | `TODO.md` | Open work: display polish, non-LLM translation providers |
 | `CLAUDE.md` | Dependency and version-bump policy (mandatory) |
 
@@ -64,7 +64,7 @@ bun test tests/thinking-translator.test.ts -t "config paths"   # single test by 
 omp -e /absolute/path/to/extensions/thinking-translator.ts
 
 # Install / refresh the plugin after the bump-version run on main finishes (see CLAUDE.md)
-omp plugin install git:github.com/Mouriya-Emma/omp-thinking-translator
+omp plugin install git:github.com/oh-my-omp/omp-thinking-translator
 omp plugin list                   # confirm the displayed version matches package.json
 ```
 
@@ -105,4 +105,4 @@ Config precedence: defaults < global < project, merged per field; `translatorMod
 - Coverage: config paths and merge/validation, model chain parsing (order, per-entry effort, whole-chain replacement, rejection of incomplete entries), effort parsing, effort → `streamSimple` option mapping, Latin gating, complete-line/streaming block matching incl. the reveal-frame-minus-period regression, cache key, translation cleanup/splitting, `SOURCE_TEXT_BEGIN` per-attempt cancellation, late-row payload building, and the host display-rewrite contract. **Not** covered: extension activation, live model calls and the fallback order across them (verify from a real session's trace: `request`/`modelFailed` records per model), the provider wire field an effort level maps to (verify with `PI_REQ_DEBUG=1`, which dumps each request body to `rr-session-N.json` in the cwd), model discovery, renderer/notify factory integration, ANSI frozen-scrollback timing, or the native `describe` path.
 - Expectations: any change to a `__testing` helper or the block-matching/late-row rules gets a behavioral test in the same file; lifecycle/renderer changes are verified by running a session-saving omp against the change and reading the per-session trace file (`session_start → message_start → thinking_end → dispatch → request (→ modelFailed → request on the next model) → done → settled → render → painted → lateFlush`), plus observing the box (`done/total` title) and late `notify` rows. Fresh processes are not representative of long-lived agentic sessions: model discovery is re-run at startup and hub PTYs do not commit rows to native scrollback, so a change that "works in `/tmp`" must still be confirmed from a real session's trace. Manual repro steps for the context-exclusion boundary live in `README.md` (Context Boundary section).
 - Known limitations to keep in mind when judging "expected" behavior: folded/invisible blocks never render; in ANSI terminals scrollback freezes at the first tool call (late rows fall back to notify; not used on a Tern native surface); no backfill on session reopen; identical lines share one translation per model chain+language; thinking lines are sent to the configured translator models, and to later ones in the chain when earlier ones fail (privacy note in README). The native `describe` path has no unit coverage; verify it in a real Tern pane (record with `PI_TUI_TSP_RECORD`).
-- `README.md` is kept in step with the code (install command is `omp plugin install …`, pins match `package.json`); if they disagree, `package.json` and `CLAUDE.md` win and the README is the thing to fix.
+- `README.md` and `README.zh-CN.md` are kept in step with the code and with each other (install command is `omp plugin install …`, pins match `package.json`); if they disagree, `package.json` and `CLAUDE.md` win and the READMEs are the thing to fix.

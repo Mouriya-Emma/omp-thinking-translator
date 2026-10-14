@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Mouriya-Emma/omp-thinking-translator.git"
+    "url": "git+https://github.com/oh-my-omp/omp-thinking-translator.git"
   },
-  "homepage": "https://github.com/Mouriya-Emma/omp-thinking-translator#readme",
+  "homepage": "https://github.com/oh-my-omp/omp-thinking-translator#readme",
   "bugs": {
-    "url": "https://github.com/Mouriya-Emma/omp-thinking-translator/issues"
+    "url": "https://github.com/oh-my-omp/omp-thinking-translator/issues"
   },
   "private": true,
   "keywords": [
@@ -26,7 +26,8 @@
   },
   "files": [
     "extensions",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md"
   ],
   "omp": {
     "extensions": [

@@ -1,5 +1,7 @@
 # omp-thinking-translator
 
+English | [简体中文](README.zh-CN.md)
+
 An omp extension that translates visible assistant thinking blocks into another language for display only.
 
 It renders one translation box directly below each visible assistant thinking block. In a Tern Surface Protocol terminal (Tern) the box is a native collapsible `omp.thinking` section with the same shape as the host's own thinking: open while translations are arriving, and once they settle it follows the host's `expandThinkingBlocks` setting — folded when that is off (the default), kept open when it is on. In every other terminal it is the ANSI box. If a translation finishes after an ANSI box can no longer be repainted, it emits a debounced in-flow transcript row at the current transcript tail. Translations stay in extension memory: they are never written to the session file, never part of the next model request, and never part of compaction input. See [Context Boundary](#context-boundary) for the mechanism, the runtime evidence, and what is explicitly not covered. The one file the extension does write is a diagnostic trace next to the session file (`trace` option below), which records the extension's own steps and never the session content.
@@ -27,7 +29,7 @@ This extension is omp-only, not a pi extension. It is built on omp's extension A
 This extension is installed from git; it is not published to any package registry.
 
 ```bash
-omp plugin install git:github.com/Mouriya-Emma/omp-thinking-translator
+omp plugin install git:github.com/oh-my-omp/omp-thinking-translator
 ```
 
 For local development, either load the extension file directly:
@@ -49,7 +51,7 @@ The manifest key is `omp.extensions`, and the pinned `@oh-my-pi/*` 18.8.7 packag
 1. Install the extension:
 
    ```bash
-   omp plugin install git:github.com/Mouriya-Emma/omp-thinking-translator
+   omp plugin install git:github.com/oh-my-omp/omp-thinking-translator
    ```
 
 2. Create a global config template from inside omp:
@@ -156,10 +158,10 @@ The translation box is presentation output, not conversation content. The canoni
 
 Mechanism:
 
-- Translations live in a module-local `Map` keyed by the raw thinking line plus translator model chain and target language (`extensions/thinking-translator.ts:118`, `cellKey` `:560`), read only by the component returned from `pi.registerAssistantThinkingRenderer` and by the in-flow notify fallback (`extensions/thinking-translator.ts:150-254`, `:269-296`). Those rows flow into the TUI container tree and terminate at the terminal write; on host 18.1.19 no consumer of them reached a session writer, the provider request builder, or compaction (`assistant-message.ts:841-860` → `pi-tui/src/tui.ts:486-513` → `tui.ts:2735-2781`), and 18.2.0's `#appendThinkingExtensions` (`assistant-message.ts:841-860`) still hands the renderer a fresh context object and only mounts the returned component.
+- Translations live in a module-local `Map` keyed by the raw thinking line plus translator model chain and target language (`extensions/thinking-translator.ts:121`, `cellKey` `:577`), read only by the component returned from `pi.registerAssistantThinkingRenderer` and by the in-flow notify fallback (`extensions/thinking-translator.ts:153-259`, `:274-301`). Those rows flow into the TUI container tree and terminate at the terminal write; on host 18.1.19 no consumer of them reached a session writer, the provider request builder, or compaction (`assistant-message.ts:841-860` → `pi-tui/src/tui.ts:486-513` → `tui.ts:2735-2781`), and 18.2.0's `#appendThinkingExtensions` (`assistant-message.ts:841-860`) still hands the renderer a fresh context object and only mounts the returned component.
 - The `context.text` handed to the renderer is a resolved display string in a freshly allocated object (`assistant-message.ts:841-852`), not a reference into the stored `AgentMessage`, so a renderer cannot mutate the message through it.
 - Persistence writes typed `SessionEntry.message` values to the session JSONL (`session-manager.ts:2288-2305`, `:817-818`); the next request is rebuilt from those entries (`session-context.ts:216-272`, `agent-loop.ts:1627-1673`); compaction partitions the same branch entries (`compaction.ts:1328-1382`). None of the three reads rendered rows.
-- The hooks that can change model-visible data in this host are `context`, `before_provider_request`, `before_agent_start`, `session_before_compact`, and `session_stop`. The extension registers none of them; its only handlers are session reset, per-message state tracking, chat-content generation, and the thinking-block bookkeeping in `message_start`/`message_update`/`message_end` (`extensions/thinking-translator.ts:333-438`).
+- The hooks that can change model-visible data in this host are `context`, `before_provider_request`, `before_agent_start`, `session_before_compact`, and `session_stop`. The extension registers none of them; its only handlers are session reset, per-message state tracking, chat-content generation, and the thinking-block bookkeeping in `message_start`/`message_update`/`message_end` (`extensions/thinking-translator.ts:338-442`).
 
 The original context-boundary checks below ran on omp 18.1.19, driving the real TUI with a throwaway read-only observer extension attached to `before_provider_request` (the final pre-send payload hook) and `session_before_compact`, using high-entropy fragments of the rendered Chinese plus the box labels `思考翻译` / `等待翻译` / `翻译失败` as canaries. The notify-specific check was repeated on omp 18.1.21 as described below:
 
@@ -179,7 +181,7 @@ Minimal reproduction:
 
 Not covered by this boundary:
 
-- **The translation request itself.** Each eligible thinking line is sent to the configured translator models as its own standalone request (`extensions/thinking-translator.ts:353-557`), separate from the agent conversation; when a model fails, the same line goes to the next model in the chain, so every provider in `translatorModels` can receive it. "Not in the agent context" does not mean "not sent to any model": those providers see your thinking text and retain it under their own policy.
+- **The translation request itself.** Each eligible thinking line is sent to the configured translator models as its own standalone request (`extensions/thinking-translator.ts:358-566`), separate from the agent conversation; when a model fails, the same line goes to the next model in the chain, so every provider in `translatorModels` can receive it. "Not in the agent context" does not mean "not sent to any model": those providers see your thinking text and retain it under their own policy.
 - **Display-derived artifacts.** Terminal scrollback, in-flow notify rows, a terminal recorder, and omp's own `/debug-transcript` (which dumps rendered rows to a temp file, `command-controller.ts:225-236`) contain translated rows by design. That is an observability surface, not conversation context.
 - **Untested paths.** The compaction check ran on a resumed persisted session, so resume is covered to the extent that its canonical messages, provider payloads, and compaction input were inspected — not that historical translations re-render or that every resume UI path was exercised. Session export/import serializers and branch switching were not exercised at all.
 - **Version scope.** The evidence is for this extension revision on omp 18.1.19 (notify check repeated on 18.1.21). The guarantee rests on the host renderer contract and on the request/compaction paths cited above, not on a documented API promise, so re-verify after a host upgrade; the current pin is 18.8.7, and the canary runs and cited host code paths date from the earlier versions and were not repeated there.
@@ -212,4 +214,4 @@ pnpm check
 - `extensions/thinking-translator.ts` — the extension: renderer registration, event handling, translation fan-out, and config commands.
 - `tests/thinking-translator.test.ts` — unit tests for config handling and the translation helpers.
 - `package.json` — manifest declaring the `omp.extensions` entry and pinned `devDependencies`.
-- `README.md` — this file.
+- `README.md` — this file; `README.zh-CN.md` is its Simplified Chinese version.
